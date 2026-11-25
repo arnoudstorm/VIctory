@@ -312,6 +312,9 @@ fn big(at: *mut u8, size: usize, made: bool) {
     if size < BIG {
         return;
     }
+    if made {
+        who_made_big(size);
+    }
     for (place, bytes) in BIG_AT.iter().zip(&BIG_BYTES) {
         if made {
             if place.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
@@ -324,6 +327,33 @@ fn big(at: *mut u8, size: usize, made: bool) {
             return;
         }
     }
+}
+
+/// Logs where the first [`WHO_MOST`] blocks of [`BIG`] bytes or more were
+/// made (a backtrace each), so the memory line's big blocks have owners.
+/// The backtrace allocates: a thread inside this call is not followed into
+/// its own allocations.
+fn who_made_big(size: usize) {
+    const WHO_MOST: u64 = 24;
+    static TOLD: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if INSIDE.with(|i| i.replace(true)) {
+        return;
+    }
+    if TOLD.fetch_add(1, Relaxed) < WHO_MOST {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        // Our own frames only, without the allocator's.
+        let frames: Vec<&str> = trace
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("victory") && !l.contains("copystat::") && !l.starts_with("at "))
+            .take(8)
+            .collect();
+        tracing::info!(mb = size >> 20, frames = ?frames, "a block of 32 MB or more made");
+    }
+    INSIDE.with(|i| i.set(false));
 }
 
 /// The sizes of our own big blocks alive, largest first, in MB.
