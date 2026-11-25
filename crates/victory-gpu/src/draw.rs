@@ -1419,7 +1419,7 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) = host.slot_copy(index, &view) else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1773,7 +1773,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, Some((host, index)));
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2050,7 +2050,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, Some((host, index)));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2175,7 +2175,8 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        // The dynamic slot this entry was made in.
+                        readable(list, u.kind, &view, Some((host, first + u.table_offset_dwords / 8)));
                     }
                 }
                 for k in selected {
@@ -2186,7 +2187,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, Some((host, first + k)));
                     }
                 }
                 made.push((slot, first * 32));
@@ -2224,7 +2225,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, Some((host, index)));
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2752,13 +2753,20 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// `slot`: the host heap and slot the view was read from, when known: a
+/// buffer view's copy is then the one the slot was made on
+/// (`HostHeap::slot_copy`).
+fn readable(list: &HostList, kind: ResourceType, view: &View, slot: Option<(&crate::descriptor::host::HostHeap, u32)>) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    let copy = match slot {
+        Some((host, index)) => host.slot_copy(index, view),
+        None => crate::descriptor::host::buffer_copy(view),
+    };
+    if let Some((shadow, address, len)) = copy {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

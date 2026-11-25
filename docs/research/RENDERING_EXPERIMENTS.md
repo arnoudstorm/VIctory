@@ -169,3 +169,18 @@ stale data on screen.
   most likely uses its fixed Series S preset and ignores these values.
   Saves exist (a 252 KB story save `SARC0015` from 08:01, a profile, the
   settings profile); they were not touched.
+
+## E18 (2026-11-25): slots share windows (`VICTORY_SHARE_WINDOWS=1`, run `share-windows`)
+
+- Change: a buffer view's slot is made on a window that already holds
+  its range (`find_any`) instead of one named by its own range, and the
+  passes bring up to date the copy each slot was made on
+  (`HostHeap::slot_copy`; for all five `readable` callers and the heap
+  pass). Nothing is swapped under a slot or a list, unlike E17.
+- Actual, against `window-shapes`: **stable** (420 s, no device
+  removal, black detector only at the cut), picture right (frame 2769).
+  Faster: frame 806 -> 662 ms (1.75 -> 1.86 fps), moves 90 -> 51 ms,
+  CPU 519 -> 391 ms. But **not less memory**: window tiles 1,522 ->
+  1,939 MB, GPU memory 7,189 -> 7,424 MB, because the longer windows
+  slots now take stay alive and fill more tiles. Kept as an opt-in speed
+  option, off by default.

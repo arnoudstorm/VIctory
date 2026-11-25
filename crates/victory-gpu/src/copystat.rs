@@ -898,12 +898,13 @@ fn log_memory() {
     );
     let o = crate::shadow::window_overlap();
     tracing::info!(
-        "memory, windows by shape: tails {:.0} MB over {:.0} MB of title memory, grid windows {:.0} MB over {:.0} MB;          both kinds together over {:.0} MB",
+        "memory, windows by shape: tails {:.0} MB over {:.0} MB of title memory, grid windows {:.0} MB over {:.0} MB;          both kinds together over {:.0} MB; slots brought up to date on the copy they were made on (VICTORY_SHARE_WINDOWS): {}",
         mb(o[0]),
         mb(o[1]),
         mb(o[2]),
         mb(o[3]),
         mb(o[4]),
+        crate::descriptor::host::SHARED_HITS.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 

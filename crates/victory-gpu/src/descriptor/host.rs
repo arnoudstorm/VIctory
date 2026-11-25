@@ -31,6 +31,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// The host copy each buffer view's slot was made on
+    /// (`VICTORY_SHARE_WINDOWS`): the copy the passes bring up to date for
+    /// it ([`HostHeap::slot_copy`]), whatever another lookup finds since.
+    made_on: Mutex<Vec<Option<std::sync::Weak<crate::shadow::Shadow>>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -690,6 +694,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            made_on: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1182,6 +1187,12 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // The copy the view just made was made on, if it was a buffer
+        // view's (taken whatever happens, so none is left for the next).
+        let made_on = MADE_ON.take();
+        if let Some(slot) = self.made_on.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *slot = made_on;
+        }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -1190,6 +1201,38 @@ impl HostHeap {
                 crate::host::retire(old);
             }
         }
+    }
+
+    /// The host copy, address and bytes a pass brings up to date for the
+    /// buffer view `view` of slot `index`. With `VICTORY_SHARE_WINDOWS=1`
+    /// the copy the slot was made on, as long as the slot still shows it:
+    /// a slot may then take a window another slot made
+    /// ([`share_windows`]), and a later lookup of its range may find
+    /// another one. Otherwise, or if that copy is gone, [`buffer_copy`].
+    pub(crate) fn slot_copy(&self, index: u32, view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        if share_windows() {
+            let shadow = self
+                .made_on
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index as usize)
+                .and_then(|w| w.as_ref())
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(shadow) = shadow {
+                let shows = self
+                    .kept
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(index as usize)
+                    .and_then(|k| k.as_ref())
+                    .is_some_and(|k| windows::core::Interface::as_raw(k) == windows::core::Interface::as_raw(&shadow.buffer));
+                if shows && let Some((address, len)) = buffer_range(view) {
+                    SHARED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some((shadow, address, len));
+                }
+            }
+        }
+        buffer_copy(view)
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -1642,13 +1685,47 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// `VICTORY_SHARE_WINDOWS=1`: a buffer view's slot is made on a window
+/// that already holds its range, where there is one, instead of a window
+/// named by its own range. Slots over overlapping ranges each made a
+/// window of their own, and the same title memory was copied into both:
+/// 2,031 MB of windows over 1,368 MB of title memory (run `window-shapes`).
+/// The passes then bring up to date the copy each slot was made on
+/// ([`HostHeap::slot_copy`]); nothing is swapped under a slot or a list
+/// (merging windows did that and removed the device twice, E17).
+pub(crate) fn share_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARE_WINDOWS").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: passes that brought up to date the copy a slot was
+/// made on ([`HostHeap::slot_copy`]).
+pub(crate) static SHARED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The copy the buffer view being made on this thread was made on,
+    /// for [`HostHeap::keep`].
+    static MADE_ON: std::cell::Cell<Option<std::sync::Weak<crate::shadow::Shadow>>> = const { std::cell::Cell::new(None) };
+}
+
+/// The window or buffer copy a buffer view's slot is made on.
+fn slot_window(address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let shadow = if share_windows() {
+        crate::shadow::find_any(address, len)
+    } else {
+        crate::shadow::find(address, len)
+    }?;
+    MADE_ON.set(Some(std::sync::Arc::downgrade(&shadow)));
+    Some(shadow)
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = slot_window(address, len)?;
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -1720,7 +1797,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = slot_window(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
