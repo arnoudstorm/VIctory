@@ -768,9 +768,63 @@ mod tests {
 }
 
 /// A host command list and its allocator, always used together.
+/// `VICTORY_LAZY_LISTS=1` (experiment, off by default): a host list is made
+/// closed and without command memory (`CreateCommandList1`), and opened on
+/// its allocator the first time a command is recorded into it. The driver
+/// gives a list its first block of command memory when it is opened: ~1.3 MB
+/// on the 780M (`bench_tests::what_host_lists_keep`), and the title makes
+/// 633 lists at its start of which 620 are not used before its world.
+fn lazy_lists() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_LISTS").is_some_and(|v| v == "1"))
+}
+
+/// A host command list that may not be open yet ([`lazy_lists`]). Using it
+/// as the list (`Deref`) opens it first; [`LazyList::raw`] does not, for
+/// closing, resetting and submitting, where a list never opened stays as
+/// it was made: closed and empty.
+pub(crate) struct LazyList {
+    list: ID3D12GraphicsCommandList,
+    allocator: ID3D12CommandAllocator,
+    /// Made closed and not opened since.
+    unopened: std::sync::atomic::AtomicBool,
+}
+
+impl LazyList {
+    /// The list as it is, without opening it.
+    pub(crate) fn raw(&self) -> &ID3D12GraphicsCommandList {
+        &self.list
+    }
+
+    /// Whether the list was never opened (made closed and empty).
+    pub(crate) fn unopened(&self) -> bool {
+        self.unopened.load(Ordering::Acquire)
+    }
+
+}
+
+/// Lazy host lists opened so far ([`lazy_lists`]).
+pub(crate) static LAZY_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl std::ops::Deref for LazyList {
+    type Target = ID3D12GraphicsCommandList;
+
+    fn deref(&self) -> &ID3D12GraphicsCommandList {
+        if self.unopened.load(Ordering::Acquire) && self.unopened.swap(false, Ordering::AcqRel) {
+            LAZY_OPENED.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: a closed list made by `CreateCommandList1`, never
+            // submitted; its allocator holds nothing.
+            if let Err(e) = unsafe { self.list.Reset(&self.allocator, None) } {
+                fail(format_args!("a host command list made closed did not open ({e})"));
+            }
+        }
+        &self.list
+    }
+}
+
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list: LazyList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -821,6 +875,37 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_PRELUDE_POOL=1` (experiment, off by default): preludes come
+/// from one pool and go back to it once the submission that ran them has
+/// finished, instead of each host list keeping its own. A prelude is an
+/// allocator with the driver's first block of command memory (~1.1 MB on
+/// the 780M: `bench_tests::what_host_lists_keep`) for a few barriers and
+/// copies; the title's lists kept 447 of them alive.
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Preludes free for the next submission ([`prelude_pool`]).
+static PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
+/// The most the pool keeps; more are let go.
+const PRELUDES_KEPT: usize = 256;
+
+/// A pooled prelude on its way back: retired with the submission that ran
+/// it, and returned to [`PRELUDES`] when that has finished.
+struct Pooled(Option<Prelude>);
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let mut pool = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() < PRELUDES_KEPT {
+                pool.push(p);
+            }
+        }
+    }
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -2714,6 +2799,97 @@ fn late_line(frames: f64) {
 /// card, so they run alone and on request:
 /// `cargo test -p victory-gpu --lib bench_tests -- --ignored --test-threads=1 --nocapture`.
 #[cfg(test)]
+mod lazy_list_tests {
+    use super::*;
+
+    /// A lazy host list as `make_list` makes it with `VICTORY_LAZY_LISTS=1`.
+    fn lazy_list(host: &Host) -> LazyList {
+        // SAFETY: plain object creation.
+        unsafe {
+            let allocator: ID3D12CommandAllocator =
+                host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list = host
+                .device
+                .cast::<ID3D12Device4>()
+                .expect("device 4")
+                .CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE)
+                .expect("closed list");
+            LazyList { list, allocator, unopened: std::sync::atomic::AtomicBool::new(true) }
+        }
+    }
+
+    /// Runs `list` on the host queue and waits for it.
+    fn run(host: &Host, list: &ID3D12GraphicsCommandList) {
+        // SAFETY: a closed list; our own fence, waited for at once.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            host.queue.ExecuteCommandLists(&[Some(list.cast().expect("list"))]);
+            host.queue.Signal(&fence, 1).expect("signal");
+            fence.SetEventOnCompletion(1, HANDLE::default()).expect("wait");
+            assert!(host.device.GetDeviceRemovedReason().is_ok(), "device removed");
+        }
+    }
+
+    /// A lazy list never opened stays so through a reset of its
+    /// allocator (as `HostList::reset` leaves it); its first command opens
+    /// it, and what it then records runs. (It is never submitted unopened:
+    /// that removed the device on the 780M, see `Host::submit`.)
+    #[test]
+    fn lazy_lists_open_on_first_command() {
+        let Some(host) = super::host() else { return };
+        let list = lazy_list(host);
+        assert!(list.unopened());
+        // SAFETY: a fresh allocator nothing runs from.
+        unsafe { list.allocator.Reset().expect("allocator reset") };
+        assert!(list.unopened(), "a reset opened it");
+        let (src, src_at) = host.shared_buffer(1 << 16).expect("source");
+        let (dst, dst_at) = host.shared_buffer(1 << 16).expect("destination");
+        // SAFETY: mapped buffers of 64 KiB.
+        unsafe {
+            std::ptr::write_bytes(src_at, 0x5a, 4096);
+            std::ptr::write_bytes(dst_at, 0, 4096);
+        }
+        // SAFETY: a list opened by its first use; live buffers.
+        unsafe {
+            list.CopyBufferRegion(&dst, 0, &src, 0, 4096);
+            assert!(!list.unopened());
+            list.raw().Close().expect("close");
+        }
+        run(host, list.raw());
+        // SAFETY: a mapped buffer the finished copy wrote.
+        let copied = unsafe { std::slice::from_raw_parts(dst_at, 4096) };
+        assert!(copied.iter().all(|&b| b == 0x5a), "the copy recorded after opening did not run");
+    }
+
+    /// The process memory of 64 lazy lists before and after their first
+    /// command (printed for the record).
+    #[test]
+    #[ignore = "measures the whole process: run alone"]
+    fn lazy_lists_cost_nothing_until_opened() {
+        let Some(host) = super::host() else { return };
+        let ram0 = process_private_bytes();
+        let lists: Vec<_> = (0..64).map(|_| lazy_list(host)).collect();
+        let made = process_private_bytes().saturating_sub(ram0);
+        let (src, _) = host.shared_buffer(1 << 16).expect("source");
+        let (dst, _) = host.shared_buffer(1 << 16).expect("destination");
+        for list in &lists {
+            // SAFETY: opened by its first use; live buffers.
+            unsafe {
+                list.CopyBufferRegion(&dst, 0, &src, 0, 256);
+                list.raw().Close().expect("close");
+            }
+        }
+        let opened = process_private_bytes().saturating_sub(ram0);
+        eprintln!(
+            "64 lazy host lists: +{} KiB each when made, +{} KiB each once opened",
+            (made >> 10) / 64,
+            (opened >> 10) / 64
+        );
+        assert!(made < opened);
+    }
+}
+
+#[cfg(test)]
 mod bench_tests {
     use super::*;
 
@@ -2811,6 +2987,45 @@ mod bench_tests {
         let Some(host) = super::host() else { return };
         let (src, _) = host.shared_buffer(1 << 20).expect("source");
         let (dst, _) = host.shared_buffer(1 << 20).expect("destination");
+        // What a list costs before anything is recorded in it.
+        let empty0 = process_private_bytes();
+        let empty: Vec<_> = (0..64).map(|_| host.new_list().expect("list")).collect();
+        let made_empty = process_private_bytes().saturating_sub(empty0);
+        for list in &empty {
+            list.close();
+        }
+        drop(empty);
+        eprintln!("64 empty host lists: +{} MB when made ({} KiB a list)", made_empty >> 20, (made_empty >> 10) / 64);
+        // Which of the two objects costs it: 64 allocators alone, then 64
+        // lists on one allocator (each closed before the next is made).
+        let a0 = process_private_bytes();
+        // SAFETY: plain object creation.
+        let allocators: Vec<ID3D12CommandAllocator> = (0..64)
+            .map(|_| unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.expect("allocator"))
+            .collect();
+        let made_allocators = process_private_bytes().saturating_sub(a0);
+        let l0 = process_private_bytes();
+        let one_allocator_lists: Vec<ID3D12GraphicsCommandList> = (0..64)
+            .map(|_| {
+                // SAFETY: plain object creation; closed at once, so the allocator is free for the next.
+                unsafe {
+                    let list: ID3D12GraphicsCommandList = host
+                        .device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None)
+                        .expect("list");
+                    list.Close().expect("close");
+                    list
+                }
+            })
+            .collect();
+        let made_lists = process_private_bytes().saturating_sub(l0);
+        drop(one_allocator_lists);
+        drop(allocators);
+        eprintln!(
+            "64 allocators alone: +{} KiB each; 64 lists on one allocator: +{} KiB each",
+            (made_allocators >> 10) / 64,
+            (made_lists >> 10) / 64
+        );
         let ram0 = process_private_bytes();
         let lists: Vec<_> = (0..64)
             .map(|_| {
@@ -3336,12 +3551,21 @@ impl Host {
             let allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
+            let lazy = lazy_lists();
+            let list: ID3D12GraphicsCommandList = if lazy {
+                self.device.cast::<ID3D12Device4>()?.CreateCommandList1(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    D3D12_COMMAND_LIST_FLAG_NONE,
+                )?
+            } else {
+                self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?
+            };
+            let list = LazyList {
+                list,
+                allocator: allocator.clone(),
+                unopened: std::sync::atomic::AtomicBool::new(lazy),
+            };
             let prelude = OnceLock::new();
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
@@ -4530,7 +4754,12 @@ impl Host {
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
-            lists.push(list.list.cast().ok());
+            // A list never opened has nothing to run, and must not be sent:
+            // a `CreateCommandList1` list that was never opened removed the
+            // device on the 780M (`lazy_list_tests`).
+            if !list.list.unopened() {
+                lists.push(list.list.raw().cast().ok());
+            }
         }
         batch.flush();
         crate::watch::ask_once_end();
@@ -4569,7 +4798,10 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
+                // (Empty when every list was never opened: nothing to run.)
+                if !lists.is_empty() {
+                    self.queue.ExecuteCommandLists(&lists);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -4625,7 +4857,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if !group.is_empty() {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5016,8 +5250,12 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        // A list never opened was made closed.
+        if self.list.unopened() {
+            return;
+        }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        if let Err(e) = unsafe { self.list.raw().Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -5049,7 +5287,9 @@ impl HostList {
         let reset = unsafe {
             self.allocator
                 .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+                // A list never opened stays closed and empty: its first
+                // command opens it.
+                .and_then(|()| if self.list.unopened() { Ok(()) } else { self.list.raw().Reset(&self.allocator, None) })
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
@@ -5395,11 +5635,17 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        // With the pool a prelude is taken for this submission only and
+        // retired after it: back in the pool once the card has run it.
+        let pooled = prelude_pool().then(|| {
+            let taken = PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            taken.or_else(|| host().and_then(|h| h.make_prelude()))
+        });
+        let held = match &pooled {
+            Some(p) => p.as_ref(),
+            None => self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref(),
+        };
+        let Some((allocator, list)) = held else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
@@ -5425,7 +5671,13 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let out = list.cast().ok();
+        // This submission was counted as started before its preludes were
+        // recorded (`submit`), so the retirement waits for it.
+        if let Some(Some(p)) = pooled {
+            retire(Pooled(Some(p)));
+        }
+        out
     }
 
     /// Notes what the command about to be recorded does, as a marker
