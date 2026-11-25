@@ -94,3 +94,19 @@ card and CPU side agree; unmapped tiles read 0 on the card). Workspace:
   refuse left null`, a raw view at bytes 8-72 of a 256 KiB window); the
   check does not look at whether the buffer is tiled, and its unordered
   sibling shows in untiled runs. Not tied to tiling; logged once.
+
+## The page pool as a section (second redesign): measured, does not pay here
+
+On top of tiled windows and lazy lists, 220 s runs, no keys:
+
+| Switch | Result |
+|---|---|
+| `VICTORY_INPLACE_RUNS=1` (runs over views through a second view of the section) | Fewer tiles mapped (1.39-1.46 GB) since some runs went in place; the card's peak unchanged (7.1-7.2 GB); the device was removed at 107 s with 92 MB of RAM free (memory exhaustion, as before) |
+| `VICTORY_POOL_COMMIT=1` (the pool one committed section, openable as a heap) | 232 windows (122 MB) in place; **3,180 runs over views refused by the host**; peak unchanged (7.1-7.2 GB); no errors |
+
+- The census in the world: runs over views 1.2-1.3 GB, scattered 0.6-0.8
+  GB, **partly outside any view 3.0-4.5 GB**. The section approach can
+  reach the first group at most, and the driver refuses most of it.
+- What would change it: views of title memory in runs instead of single
+  pages (Project Flamingo `a79befd`, `compare-flamingo-2026-11-25.md`),
+  so that windows lie inside one view and can be opened in place.
