@@ -2,6 +2,7 @@
 
 Written by run_report.py while the game runs. Newest first.
 
+- [run-2026-11-25-0450](run-2026-11-25-0450.md): No failure seen yet.
 - [run-2026-11-25-0440](run-2026-11-25-0440.md): The GPU device was removed with no out-of-memory before it; see the error lines.
 - [run-2026-11-25-0437](run-2026-11-25-0437.md): The GPU device was removed with no out-of-memory before it; see the error lines.
 - [run-2026-11-25-0434](run-2026-11-25-0434.md): Shared GPU memory ran out: allocations failed with E_OUTOFMEMORY, then the driver removed the device. The 780M's Direct3D budget is about 6 GB of the PC's memory; see 'Memory' below for what used it.
