@@ -2,6 +2,7 @@
 
 Written by run_report.py while the game runs. Newest first.
 
+- [run-2026-11-25-0256](run-2026-11-25-0256.md): No failure seen yet.
 - [run-2026-11-25-0206](run-2026-11-25-0206.md): Shared GPU memory ran out: allocations failed with E_OUTOFMEMORY, then the driver removed the device. The 780M's Direct3D budget is about 6 GB of the PC's memory; see 'Memory' below for what used it.
 - [run-2026-11-25-0159](run-2026-11-25-0159.md): Shared GPU memory ran out: allocations failed with E_OUTOFMEMORY, then the driver removed the device. The 780M's Direct3D budget is about 6 GB of the PC's memory; see 'Memory' below for what used it.
 - [run-2026-11-25-0153](run-2026-11-25-0153.md): No failure seen yet.
