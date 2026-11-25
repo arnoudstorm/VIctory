@@ -8,8 +8,14 @@ what was checked directly is in `REPOSITORY_RANKINGS.md` and
 | Tracker | State when read | Leader it names | Notes |
 |---|---|---|---|
 | https://portwatch.online/ ("PortWatch VI") | "Partial snapshot, sync unavailable"; newest history point 2026-11-24 | omonkey, 76 % "In-game" (private, no repository) | scores are "third-party estimates", not completion; "Playable builds: 0". VIctory 67 % "Main menu", XCL 62.5 % "Main menu" |
-| https://4lwayz.github.io/portwatch-vi/ | not read: answers 301 to another host (`portwatch-vi.xyz`), not followed | - | - |
+| https://4lwayz.github.io/portwatch-vi/ | redirects (301) to http://portwatch-vi.xyz/, whose list loads from `data/tracker.json` ("updated" 2026-11-25T13:45Z; first ~40k of 267k characters read verbatim, the rest summarised) | Belobug/VIctory-Belobug-AMD, 77.4 %, "#1 on our board" among public code; omonkey's private build 76 % | 36+ projects; "verification" field: only Belobug, DexNom and the private Doomsday are marked `portwatch`, every other entry `self-reported`; victory-gta6 (fxceless) 74 %, ZTRX 64.2 %, XCL 62.5 %, VIctory 55 %; none playable |
 | https://vuyp.github.io/gta6-pc-race/ ("GTA VI PC Race") | "Checked 15:13 UTC on 25 Nov" | klbf-lab, stage 6 of 7 "In-game" | 32 open-source and 3 private projects; "Playable: no"; about 17 projects at "In-game" |
+
+## What the three agree on
+
+- No project is playable; the furthest are "in-game" at 1-14 fps by their own reports.
+- Among public code, Belobug ranks first on portwatch-vi and is one of the two the tracker verified itself; this branch took its ambient light and its integer-target blend fix and validated both here.
+- Private builds (omonkey, CGBJ, Doomsday, suri) lead some boards but publish nothing to check or take.
 
 ## Where this branch stands against the trackers' stages
 

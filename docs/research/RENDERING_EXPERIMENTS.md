@@ -184,3 +184,26 @@ stale data on screen.
   1,939 MB, GPU memory 7,189 -> 7,424 MB, because the longer windows
   slots now take stay alive and fill more tiles. Kept as an opt-in speed
   option, off by default.
+
+## E19 (2026-11-25): skipping the intro (hold A), run `skip-intro`: the title's tile pool is full
+
+- Settings: `VICTORY_FFX_BUILTIN=1 VICTORY_AMBIENT=0.6`, pad A held 4 s every
+  15 s from 70 s (`hold_a_keys.txt` in the session notes).
+- Actual: the intro was skipped; the loading screen ran at 30 fps (3 draws);
+  at 115 s the **title crashed** (access violations reading
+  `0xffffffffffffffff` and `0x20` in title code, three threads). Free RAM
+  5 MB, private 11.5 GB.
+- The title's own crash context (`temp\*.crash.log`): console Lockhart
+  (Series S), SRL `int_prolo_int_prolo_int_min` in **Prestream** (upstream
+  #1118), **TileHeap used 3,977 of 3,977 MB**, Game Physical 1,289 of
+  1,339 MB, 228 streaming requests.
+- The TileHeap is the title's own pool inside the physical pages it asked
+  for at start (`XMemAllocatePhysicalPages`, 3,977 MB); VIctory does not
+  size it. A real Series S has the same pool, so the title asks for more
+  tiles here than it would there. The title never calls
+  `XMemGetWorkingSetStatistics` (no log line), so VIctory's answer there is
+  not the cause.
+- Next lead: what the title's texture streaming reads back from the GPU to
+  pick mip levels. A read-back that comes back wrong (zeros: "the finest
+  level everywhere") would fill the pool. To check: find the streaming
+  feedback pass and what it writes; compare what the CPU gets back.

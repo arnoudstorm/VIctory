@@ -1,5 +1,7 @@
 # Next steps
 
+0. **Past the prison intro (E19):** the post-intro load dies with the title's TileHeap full (3,977/3,977 MB). Find the texture-streaming feedback the title reads back from the GPU and check it is right; a wrong read-back asking for the finest mips everywhere would fill the pool (and lower-detail textures would follow from fixing it).
+
 1. **Background recompiles off** needs Windows Developer Mode (`SetBackgroundProcessingMode` returned an error without it); with it on, rerun `bg-off` and check `ok=true`.
 1b. **Isolate the combined run's gain** (748 ms per frame in `all-new`):
    one run with only `VICTORY_D3D12_BACKGROUND=0` added to the baseline,
