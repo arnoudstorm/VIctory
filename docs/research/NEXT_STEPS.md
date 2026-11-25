@@ -1,13 +1,14 @@
 # Next steps
 
-0. CPU time is now the limit (409 ms per frame after E7). Split it per
-   step of a submission (texture refreshes, write-watch asks, snapshots,
-   compares) and attack the largest. CPU compares: one run with
-   `VICTORY_CARD_BUFFERS_MB=1536`, which would put the 401 MB the cap
-   kept off onto the card, watching GPU memory (already over budget) and
-   paging.
-   Shader cost: the GPU is only ~55 % busy, so shaders are not the limit
-   yet; per-pipeline GPU timestamps would be needed first.
+0. **Smoothness (CPU bound, about 400 ms per frame):** finish in-place
+   runs (`VICTORY_INPLACE_RUNS`, `inplace.rs`). They place ~1 GB of
+   windows in place, but asks are still served by copied windows beside
+   them (`shadow.rs`, `loose`: `place_for` is asked only when a new window
+   is made, so windows already copied keep being used). Route asks inside
+   a placed run to the placed buffer and let the copied windows go, then
+   measure moves, watches and snapshots (E8) and the card's memory.
+   Expected gain: most of the 84 ms of moves and part of the watches.
+   Large change; one step at a time.
 1. **Lighting (earliest wrong stage now):** surfaces outside direct sun are
    near black. Dump the targets of one gameplay frame (VICTORY_DUMP_TARGETS)
    and follow the lighting pass's inputs: sky light, light probes, ambient

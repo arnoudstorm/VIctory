@@ -83,3 +83,27 @@ Logs and frames are outside the repo (session notes folder).
   (mean 35.9-228.6), black detector only at the cut (2475), no device
   removal. Free RAM fell to 5 MB in both runs.
 - Tests: 544 passed, 0 failed.
+
+## E8 (2026-11-25): where the CPU time goes after E7 (run `staging-fix`, no change)
+
+The submitting thread prepares about 39 submissions per frame, spending
+about 136 ms user and 93 ms kernel time per frame inside them. Recording
+threads spend 81-88 ms each in parallel, which is not the limit. Per
+frame:
+
+| Step | ms |
+|---|---|
+| moves (kernel copies of title memory into host copies, `copy_mapped`) | 84 |
+| snapshots of shader-written ranges | 50 |
+| write-watch asks | 49 |
+| finding what shaders wrote | 27 |
+| guards | 24 |
+| page faults | 35,700 per frame |
+
+The levers that look cheap were already pulled by earlier sessions (see
+`run-laptop.ps1`): refreshes and compares over threads (`WIDE_REFRESH`,
+`WIDE_BACK`), joined copies, windows in place (`VICTORY_INPLACE=1`),
+the card cap lowered to 256 MB for memory, and tiled windows. The
+reported display mode is ignored by the title (`resolution-hdr-780m.md`).
+What is left is structural: stop copying title memory the card can read
+in place.
