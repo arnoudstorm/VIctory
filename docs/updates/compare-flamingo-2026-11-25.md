@@ -25,3 +25,23 @@ diverged since `ffe310e`), then the suite and an automated game run.
 with views in runs, windows could lie inside one view and be opened in
 place instead of copied. `ec9247f` addresses the "Not responding" milestone
 directly.
+
+## Ported (2026-11-25, on top of lazy lists and tiled windows)
+
+| Commit here | From Flamingo | What it does |
+|---|---|---|
+| `fc4aa27` | `a79befd` as `d549a33` left it | Unmaps scatter runs in one call; every mapped page keeps its own view. Flamingo itself took back the mapping in runs on Windows (a larger view unmaps its neighbours while other threads read them), so **this gives no in-place memory gain**, only fewer system calls |
+| `514eb21` | `ec9247f` | Stand-in window pumped by a thread of ours |
+| cherry-picks (`-x`) | `deeb98c`, `da125a4`, `7183336`, `35ecf4d` | Half floats keep NaN and round ties to even; sampler mip-none, LOD range, bias clamp and invalid enums; audio decoded into unaligned buffers; input callbacks serialized |
+
+Not ported: `d3ebb55` (DXIL signature and oversized mesh outputs: 16
+conflicts in the shader translator, which has diverged; not proven to be
+what refuses our mesh pipeline), and `87354e4`, `4963b3d`, `5eb53e2`,
+`e7e3efc`, `4e36493` (each conflicts).
+
+Checked: `cargo test --workspace` **536 passed, 0 failed**. Game run
+`p8-flamingo` (240 s, Enter at 60 s, laptop settings): **0 seconds "Not
+responding"** (11-26 s in every run before), the window brought to the
+front and back, frame 600 right (same planes), the world from ~155 s, no
+error, no out-of-memory. The card's peak is unchanged (7.1-7.5 GB of
+5.8 GB): none of these touch the memory picture.
