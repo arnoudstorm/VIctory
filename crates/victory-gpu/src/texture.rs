@@ -55,6 +55,10 @@ pub(crate) struct Staging {
     /// Highest late-submission number (`crate::host::STARTED`) that may
     /// still be reading this staging buffer on the GPU (`0` if none).
     in_flight: std::sync::atomic::AtomicU64,
+    /// Whether the submission being prepared recorded a GPU copy from this
+    /// staging buffer ([`Staging::take_upload`]): only such a submission
+    /// reads it on the GPU, so only it marks it in flight.
+    recorded: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -613,7 +617,19 @@ impl Staging {
         use std::sync::atomic::Ordering::AcqRel;
         let first = !self.uploaded.swap(true, AcqRel);
         let dirty = self.dirty.swap(false, AcqRel);
+        if first || dirty {
+            self.recorded.store(true, std::sync::atomic::Ordering::Release);
+        }
         first || dirty
+    }
+
+    /// Whether the submission being prepared recorded a GPU copy from this
+    /// staging buffer, clearing it: the GPU reads it only then. Before,
+    /// every staging buffer a submission named was marked in flight, also
+    /// the unchanged ones it did not copy from, and the next submission
+    /// that named one waited for the card for nothing (run `why-waits`).
+    pub(crate) fn take_recorded(&self) -> bool {
+        self.recorded.swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Records the copy of every subresource from the staging buffer into
@@ -1233,6 +1249,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         in_flight: std::sync::atomic::AtomicU64::new(0),
+        recorded: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

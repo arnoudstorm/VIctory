@@ -1,10 +1,13 @@
 # Next steps
 
-0. CPU-side write checks (audit #2): find why 370 MB of copies of 1 MiB
-   or more stay on the CPU although the threshold is 1 MiB: log the card
-   bytes alive against `VICTORY_CARD_BUFFERS_MB` (1,024 MB), then one run
-   with a higher cap. Compare against the ~15 % run-to-run spread (E5).
-
+0. CPU time is now the limit (409 ms per frame after E7). Split it per
+   step of a submission (texture refreshes, write-watch asks, snapshots,
+   compares) and attack the largest. CPU compares: one run with
+   `VICTORY_CARD_BUFFERS_MB=1536`, which would put the 401 MB the cap
+   kept off onto the card, watching GPU memory (already over budget) and
+   paging.
+   Shader cost: the GPU is only ~55 % busy, so shaders are not the limit
+   yet; per-pipeline GPU timestamps would be needed first.
 1. **Lighting (earliest wrong stage now):** surfaces outside direct sun are
    near black. Dump the targets of one gameplay frame (VICTORY_DUMP_TARGETS)
    and follow the lighting pass's inputs: sky light, light probes, ambient

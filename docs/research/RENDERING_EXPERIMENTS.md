@@ -44,3 +44,42 @@ Logs and frames are outside the repo (session notes folder).
   reached frame 2480. The capture folder also keeps older runs' frames
   above the new run's last frame; filter by the log's "frame saved"
   lines.
+
+## E6 (2026-11-25): what the 16 syncs per frame and the 400 MB of CPU compares are (run `why-waits`)
+
+- Change: counters only (submissions held for a texture staging buffer
+  in flight; why `card_for` keeps a title buffer's copy off the card).
+- Result:
+  - **Syncs:** 13.9 of the 16 "title memory read" settles per frame were
+    holds for texture staging buffers still in flight (about 100
+    buffers, 76-93 MB). Every staging buffer a submission named was
+    marked in flight, also the unchanged ones it did not copy from.
+  - **CPU compares:** 72 copies (401 MB) were kept off the card by the
+    cap (`VICTORY_CARD_BUFFERS_MB`, 1,024 MB), and 2 (5 MB) by the
+    card's budget.
+
+## E7 (2026-11-25): mark only staging buffers copied from (run `staging-fix`)
+
+- Change: `Staging::take_recorded`. A staging buffer is marked in flight
+  only by the submission that recorded a GPU copy from it.
+  `VICTORY_STAGING_MARK_ALL=1` restores the old behaviour. Test
+  `only_a_staging_buffer_copied_from_is_marked_in_flight`.
+- Hypothesis: the 14 holds go away, and with them most of the waiting.
+- Actual (`why-waits` -> `staging-fix`, same settings, world samples
+  198 / 213):
+
+| | before | after |
+|---|---|---|
+| holds for staging in flight per frame | 13.9 | 0.0 |
+| settles per frame | 16.0 | 5.2 |
+| waiting for the card in settles, ms per frame | 342 | 201 |
+| frame (overlay), ms | 782 (1.46 fps) | 732 (1.59 fps) |
+| CPU, ms | 372 | 409 |
+| GPU wait, ms | 339 | 222 |
+
+  The frame time gain (6 %) is inside the run-to-run spread (about
+  15 %, E5). The waits clearly fell, but CPU time rose: the CPU is now
+  the limit. Picture: unchanged, 63 saved world frames 2476-2899 all lit
+  (mean 35.9-228.6), black detector only at the cut (2475), no device
+  removal. Free RAM fell to 5 MB in both runs.
+- Tests: 544 passed, 0 failed.

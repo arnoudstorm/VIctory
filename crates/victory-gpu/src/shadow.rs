@@ -207,9 +207,14 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if size < least || size >= 1 << 30 {
         return None;
     }
+    let refused = |why: usize| {
+        CARD_REFUSED[why * 2].fetch_add(1, Ordering::Relaxed);
+        CARD_REFUSED[why * 2 + 1].fetch_add(size, Ordering::Relaxed);
+        None
+    };
     let host = host()?;
     if !host.card_ready() {
-        return None;
+        return refused(0);
     }
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
@@ -220,17 +225,34 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
-        return None;
+        return refused(1);
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+        return refused(2);
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        return refused(3);
     }
     buffer
+}
+
+/// Title buffers' copies that [`card_for`] kept off the card, counts then
+/// bytes, by why: the host was not ready, the card's budget (a fifth must
+/// stay free), the cap (`VICTORY_CARD_BUFFERS_MB`), the buffer was not
+/// made. Since the start of the run.
+static CARD_REFUSED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// [`CARD_REFUSED`] as text, for the frame-rate line.
+fn card_refused_text() -> String {
+    let r: Vec<u64> = CARD_REFUSED.iter().map(|r| r.load(Ordering::Relaxed)).collect();
+    let mb = |b: u64| b >> 20;
+    format!(
+        "copies kept off the card since the start: host not ready {} ({} MB), card budget {} ({} MB), cap {} ({} MB), not made {} ({} MB)",
+        r[0], mb(r[1]), r[2], mb(r[3]), r[4], mb(r[5]), r[6], mb(r[7])
+    )
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -1305,7 +1327,7 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more (1 MiB is the card's threshold: these were kept off the card; {})",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -1313,6 +1335,7 @@ pub(crate) fn back_line(frames: f64) {
         c[6],
         mb(c[1]),
         mb(c[4]),
+        card_refused_text(),
     );
 }
 

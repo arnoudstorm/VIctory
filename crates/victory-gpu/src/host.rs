@@ -2356,8 +2356,41 @@ fn staging_in_flight_at(runs: &[&HostList], finished: u64) -> bool {
     })
 }
 
+/// `VICTORY_STAGING_MARK_ALL=1`: every staging buffer a submission names
+/// is marked in flight, copied from or not (the old behaviour).
+fn mark_all_staging() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_MARK_ALL").is_some_and(|v| v == "1"))
+}
+
 fn staging_in_flight(runs: &[&HostList]) -> bool {
     staging_in_flight_at(runs, FINISHED.load(Ordering::Acquire))
+}
+
+/// Since the last frame-rate line: submissions held up because a texture
+/// upload would refill a staging buffer an earlier submission still reads
+/// ([`staging_in_flight`]), the staging buffers that were in flight then,
+/// and their bytes. These count as "title memory read" settles too, under
+/// none of its four kinds.
+static STAGING_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts a hold for [`STAGING_HOLDS`].
+fn count_staging_hold(runs: &[&HostList]) {
+    let finished = FINISHED.load(Ordering::Acquire);
+    let (mut count, mut bytes) = (0u64, 0u64);
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Texture(staging) = step
+                && staging.in_flight() > finished
+            {
+                count += 1;
+                bytes += staging.memory().1 as u64;
+            }
+        }
+    }
+    STAGING_HOLDS[0].fetch_add(1, Ordering::Relaxed);
+    STAGING_HOLDS[1].fetch_add(count, Ordering::Relaxed);
+    STAGING_HOLDS[2].fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -2753,6 +2786,15 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
+    {
+        let h: Vec<f64> = STAGING_HOLDS.iter().map(|h| h.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "submissions held per frame for a texture staging buffer still in flight: {:.1} (of the title memory read settles),              {:.1} staging buffers in flight then, {:.1} MB",
+            h[0],
+            h[1],
+            h[2] / (1 << 20) as f64
+        );
+    }
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
@@ -3513,6 +3555,69 @@ mod late_tests {
         assert!(super::staging_in_flight_at(&[&list], 9));
         assert!(!super::staging_in_flight_at(&[&list], 10));
         assert!(!super::staging_in_flight_at(&[&list], 11));
+        list.close();
+        drop(list);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource, 0x10,
+        );
+        assert_eq!(release(resource), 0);
+    }
+
+    #[test]
+    fn only_a_staging_buffer_copied_from_is_marked_in_flight() {
+        let Some(host) = super::host() else { return };
+        let heap_words: [u32; 5] = [1, 0, 0, 1, 1];
+        let desc_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 28, 1, 0, 256, 0, 0];
+        // SAFETY: plain repr(C) structs matching D3D12 layouts.
+        let (heap, desc) = unsafe {
+            (
+                std::mem::transmute::<[u32; 5], crate::resource::HeapProperties>(heap_words),
+                std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(desc_words),
+            )
+        };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                &heap,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            crate::object::S_OK
+        );
+        let tex = crate::resource::host_resource(resource).expect("host texture");
+        let list = host.new_list().expect("host list");
+        crate::texture::upload(&list, resource, tex);
+        let staging = list
+            .deferred()
+            .copies
+            .iter()
+            .find_map(|step| match step {
+                super::Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .expect("a staging step");
+        // Nothing recorded yet: no copy from it, nothing to mark.
+        assert!(!staging.take_recorded());
+        // The first upload records a copy: this submission reads it.
+        assert!(staging.take_upload());
+        assert!(staging.take_recorded());
+        assert!(!staging.take_recorded(), "cleared once taken");
+        // Unchanged since: no copy, so a later submission does not mark it
+        // and nothing waits for the card on its account.
+        assert!(!staging.take_upload());
+        assert!(!staging.take_recorded());
+        drop(staging);
         list.close();
         drop(list);
         let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
@@ -4909,6 +5014,7 @@ impl Host {
             }
         }
         if late && staging_in_flight(runs) {
+            count_staging_hold(runs);
             if relay_exact() {
                 relay_wait(WHY_READ, |_| !staging_in_flight(runs));
             } else {
@@ -5023,14 +5129,21 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
-        if late {
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Texture(staging) = step {
-                        staging.mark_in_flight(this_submission);
-                    }
+        // Only the staging buffers this submission copies from are read on
+        // the card ([`crate::texture::Staging::take_recorded`]); the flag is
+        // cleared for every submission, waited for or not.
+        // `VICTORY_STAGING_MARK_ALL=1`: every staging buffer named, as before.
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Texture(staging) = step
+                    && (staging.take_recorded() || mark_all_staging())
+                    && late
+                {
+                    staging.mark_in_flight(this_submission);
                 }
             }
+        }
+        if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
