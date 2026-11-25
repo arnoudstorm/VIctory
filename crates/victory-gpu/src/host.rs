@@ -2798,6 +2798,152 @@ fn late_line(frames: f64) {
 /// host GPU: no title, no game data. They measure the whole process and
 /// card, so they run alone and on request:
 /// `cargo test -p victory-gpu --lib bench_tests -- --ignored --test-threads=1 --nocapture`.
+/// Probes for windows that hold only the pages read (the 780M audit: of
+/// the windows' 2.5 GB at the world load, 1.4 GB of pages were ever
+/// copied). Run by hand, alone: they measure the whole process, and the
+/// tile probe may remove the device if the driver refuses it.
+#[cfg(test)]
+mod window_probe_tests {
+    use super::*;
+
+    fn working_set() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+        // SAFETY: a writable counters structure and its size.
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) } != 0;
+        if ok { c.WorkingSetSize as u64 } else { 0 }
+    }
+
+    fn card(host: &Host) -> u64 {
+        host.video_memory().map_or(0, |[_, own, _, shared]| own + shared)
+    }
+
+    /// Probe 1: what pages of a window that are never written cost. 64
+    /// windows of 4 MiB made, then a quarter of each written.
+    #[test]
+    #[ignore = "probe: run alone"]
+    fn probe_untouched_window_pages() {
+        let Some(host) = super::host() else { return };
+        const SIZE: u64 = 4 << 20;
+        let (c0, p0, w0) = (card(host), process_private_bytes(), working_set());
+        let windows: Vec<_> = (0..64).map(|_| host.shared_buffer(SIZE).expect("window")).collect();
+        let (c1, p1, w1) = (card(host), process_private_bytes(), working_set());
+        for (_, at) in &windows {
+            // SAFETY: a mapped buffer of SIZE bytes.
+            unsafe { std::ptr::write_bytes(*at, 0x5a, (SIZE / 4) as usize) };
+        }
+        let (c2, p2, w2) = (card(host), process_private_bytes(), working_set());
+        let mb = |a: u64, b: u64| (b as i64 - a as i64) / (1 << 20);
+        eprintln!(
+            "256 MB of windows made: card +{} MB, private +{} MB, working set +{} MB; a quarter written: card +{} MB, private +{} MB, working set +{} MB",
+            mb(c0, c1), mb(p0, p1), mb(w0, w1), mb(c1, c2), mb(p1, p2), mb(w1, w2)
+        );
+    }
+
+    /// Probes 2 and 3: a reserved buffer whose 64 KiB tiles are mapped
+    /// onto a CPU-visible heap that a mapped placed buffer also covers.
+    /// The CPU writes through the placed buffer; a copy on the card reads
+    /// through the reserved buffer. Prints what the card is charged and
+    /// what a mapping costs.
+    #[test]
+    #[ignore = "probe: run alone; may remove the device"]
+    fn probe_window_tiles_on_a_cpu_heap() {
+        let Some(host) = super::host() else { return };
+        const TILE: u64 = 64 << 10;
+        const WINDOW: u64 = 4 << 20;
+        const HEAP: u64 = 16 * TILE;
+        // SAFETY: plain object creation, mapping and copies on our queue.
+        unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            host.device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
+                .expect("options");
+            eprintln!("tiled resources tier: {}", options.TiledResourcesTier.0);
+            let c0 = card(host);
+            let heap_desc = D3D12_HEAP_DESC {
+                SizeInBytes: HEAP,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            host.device.CreateHeap(&heap_desc, &mut heap).expect("heap");
+            let heap = heap.expect("heap");
+            let buffer = |width: u64| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: width,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut cpu: Option<ID3D12Resource> = None;
+            host.device
+                .CreatePlacedResource(&heap, 0, &buffer(HEAP), D3D12_RESOURCE_STATE_COMMON, None, &mut cpu)
+                .expect("placed buffer over the heap");
+            let cpu = cpu.expect("placed");
+            let mut at = std::ptr::null_mut();
+            cpu.Map(0, None, Some(&mut at)).expect("map");
+            let at = at.cast::<u8>();
+            let mut window: Option<ID3D12Resource> = None;
+            host.device
+                .CreateReservedResource(&buffer(WINDOW), D3D12_RESOURCE_STATE_COMMON, None, &mut window)
+                .expect("reserved window");
+            let window = window.expect("reserved");
+            let c1 = card(host);
+            // Window tiles 8..24 onto heap tiles 0..16, one mapping each.
+            let started = std::time::Instant::now();
+            for i in 0..16u32 {
+                let coord = D3D12_TILED_RESOURCE_COORDINATE { X: 8 + i, Y: 0, Z: 0, Subresource: 0 };
+                let size = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), Width: 1, Height: 1, Depth: 1 };
+                let flags = D3D12_TILE_RANGE_FLAG_NONE;
+                let start = i;
+                let count = 1u32;
+                host.queue.UpdateTileMappings(
+                    &window, 1, Some(&coord), Some(&size), &heap, 1, Some(&flags), Some(&start), Some(&count),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            let mapping_us = started.elapsed().as_micros();
+            // The CPU writes heap tile 3 (window tile 11) through the placed buffer.
+            std::ptr::write_bytes(at.add(3 * TILE as usize), 0x5a, TILE as usize);
+            // The card copies window tile 11 into a shared buffer.
+            let (out, out_at) = host.shared_buffer(TILE).expect("out");
+            std::ptr::write_bytes(out_at, 0, TILE as usize);
+            let allocator: ID3D12CommandAllocator =
+                host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList =
+                host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).expect("list");
+            list.CopyBufferRegion(&out, 0, &window, 11 * TILE, TILE);
+            list.Close().expect("close");
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            host.queue.ExecuteCommandLists(&[Some(list.cast().expect("list"))]);
+            host.queue.Signal(&fence, 1).expect("signal");
+            fence.SetEventOnCompletion(1, HANDLE::default()).expect("wait");
+            let removed = host.device.GetDeviceRemovedReason();
+            let copied = std::slice::from_raw_parts(out_at, TILE as usize);
+            let seen = copied.iter().all(|&b| b == 0x5a);
+            eprintln!(
+                "4 MiB reserved window, 16 tiles mapped on a 1 MiB CPU heap: card +{} KiB for heap and window; 16 mappings {} us; the card saw the CPU's write: {}; device: {:?}",
+                (c1 as i64 - c0 as i64) / 1024,
+                mapping_us,
+                seen,
+                removed.err().map(|e| e.code())
+            );
+            assert!(seen, "the copy through the reserved window did not see the CPU's write");
+        }
+    }
+}
+
 #[cfg(test)]
 mod lazy_list_tests {
     use super::*;
