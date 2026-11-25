@@ -111,5 +111,64 @@ What remains, by effect:
 4. **Memory for bindless copies**: more title memory in place (the page
    pool's views), which needs placed buffers that span views.
 
+## Synthetic measurements (no game data)
+
+`crates/victory-gpu/src/host.rs`, `bench_tests` (commit `c6acf1d`), run on
+the 780M with
+`cargo test -p victory-gpu --lib bench_tests -- --ignored --test-threads=1 --nocapture`:
+
+| Test | Result | Status |
+|---|---|---|
+| 64 x 8 MB buffers shared with the CPU, half dropped, half retired | card +512 MB, 0 MB left; 0 parked in the retired list (32 dropped at once) | measured, passes |
+| the same 512 MB made and dropped three times | process private left over: 256, 256, 256 MB | measured: driver reuse, not a leak |
+| a retired object while its submission runs | kept until that submission finished, dropped after | measured, passes |
+| one-copy submissions, each waited for | 1.106 ms each | measured |
+| 256 MB copy between shared buffers | 24.1 GB/s (11.1 ms) | measured |
+
+What follows from them:
+
+- Resource lifetimes on the shared-buffer and retirement paths hold: no
+  leak, nothing parked past its submission.
+- At the 30-49 submissions a world frame makes, round trips cost about
+  35-55 ms of a 1,200 ms frame: submission overhead is not what limits
+  the frame rate; the GPU work is.
+- Not measured here: behaviour at the card's budget (filling 6 GB of the
+  PC's memory on purpose would take the rest of the system with it), and
+  the GPU time of the title's own shaders (needs the game).
+
+## Test suite (Phase 4)
+
+| After | Passed | Failed | Ignored |
+|---|---|---|---|
+| `f53e10e` (baseline before this round, as recorded) | 511 | 0 | 8 |
+| `6d19463` (fxceless `c96b4f2`) | 515 | 0 | 8 |
+| `c6acf1d` (synthetic benchmarks, ignored by default) | 515 | 0 | 12 |
+
+## Settings for 16 GB and a Radeon 780M
+
+In the run script (outside the repository), with why; **not yet run with
+the game**, so their effect in the world is unverified:
+
+| Setting | Value | Why |
+|---|---|---|
+| `VICTORY_TEXTURE_ROOM_PERCENT` | 75 (instead of `VICTORY_TEXTURE_BUDGET_MB=1536`) | a texture-only cap ignores the buffers and targets that share the ~6 GB budget, and it overrides the share check; 75 % of the whole budget keeps ~1.5 GB free |
+| `VICTORY_TEXTURE_STAGE_MB` | 96 | half the default staging per frame (3x during a backlog): a lower memory peak |
+| `VICTORY_COMPILE_HEADROOM_MB` | 2048 | the world runs had 0.9-1.9 GB of commit left |
+| frame capture | off unless `-Capture` | each saved frame is a GPU read-back |
+| `-Release` | release build | no 5-second diagnostics lines; scripted keys need the diagnostics build |
+
+Kept from before (measured): Series S, `VICTORY_RELAY=2`, wide refresh and
+copy-back, joined copies, 256 KiB windows with tails, `VICTORY_INPLACE=1`,
+`VICTORY_CARD_BUFFERS_MB=256`, `VICTORY_SHADER_LOOP_LIMIT=64`,
+`VICTORY_F16_NEAREST=1`, `VICTORY_NO_WATCHDOG=1`.
+
+## Unresolved
+
+- Runs end about a minute into the world on the card's budget; the copies
+  for bindless reads (~2.4-2.6 GB) are needed as long as title memory is
+  copied, not used in place.
+- Missing textures: the backlog is larger than the budget.
+- The world's GPU time (~0.9 s a frame) is not broken down by shader yet.
+
 Changes made so far are listed in `docs/report-radeon-780m.md` and in the
 commit log of this branch.
