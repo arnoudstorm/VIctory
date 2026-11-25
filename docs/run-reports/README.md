@@ -2,7 +2,7 @@
 
 Written by run_report.py while the game runs. Newest first.
 
-- [run-2026-11-25-1417](run-2026-11-25-1417.md): No failure seen yet.
+- [run-2026-11-25-1417](run-2026-11-25-1417.md): A crash in the title or in VIctory; see the error lines.
 - [run-2026-11-25-1409](run-2026-11-25-1409.md): No failure seen yet.
 - [run-2026-11-25-1354](run-2026-11-25-1354.md): No failure seen yet.
 - [run-2026-11-25-1345](run-2026-11-25-1345.md): No failure seen yet.
