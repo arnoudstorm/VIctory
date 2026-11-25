@@ -19,6 +19,20 @@ the CPU's caches are not coherent with the card: a CPU-written texture
 path without staging would need write-combined memory, slow for the CPU,
 which is the limit here. Not built.
 
+## Later runs
+
+- `bg-off` (`VICTORY_D3D12_BACKGROUND=0` alone): 735 ms per frame, 1.62
+  fps, 300 s, no failure, but the log says the switch did **not** apply
+  (`ok=false`): `SetBackgroundProcessingMode` needs Windows Developer
+  Mode, which is off on this laptop. The frame time is therefore the
+  build's (upstream speed PRs included), not the switch's.
+- `ambient-06` (`VICTORY_AMBIENT=0.6`): 778 ms per frame, 1.67 fps, 330 s,
+  no failure; dark regions +47-53 % over no ambient. 0.6 suits the dusk
+  scene better than 0.3.
+- Controller: device 0 (XInput slot 0) connects in every run; the pad is
+  read every 8 ms with or without focus and the title takes the newest
+  state each frame (E12): the lag is the frame time.
+
 ## Research done
 
 Trackers and 18 repositories: `PORTWATCH_COMPARISON.md`,

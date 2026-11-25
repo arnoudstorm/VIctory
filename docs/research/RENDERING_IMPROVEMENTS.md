@@ -10,7 +10,7 @@ compared, so small differences are indicative only.
 | Our upscaler stands in for the title's FSR4 | `VICTORY_FFX_BUILTIN=1` (off) | the 1080p output was black: FSR4's 20 programs are console code (ACCC/FSPX) | world lit through presentation; 5 min 40 s without a black frame (`fsr4-black-output.md`) |
 | Bicubic, sharpened upscaling | `VICTORY_FFX_FILTER=bicubic`, `VICTORY_FFX_SHARPEN` (0.25) (bilinear) | bilinear 1.5x is soft | hair edge strength 5.45 / 5.17 (bilinear, two runs) -> 5.76; the window area within the bilinear range; run `bicubic`, no failure |
 | Integer render targets do not blend | always | mesh pipeline `f5e50eb2108c425b` refused in every run (first room's walls) | 0 refusals in every run since (`ambient-blend`, `upstream-perf`, `bicubic`) |
-| Least ambient light | `VICTORY_AMBIENT=<level>` (off) | everything outside direct sun near black (rays do not run) | at 0.3: left wall 7.3 -> 8.6, whole frame 37.3 -> 39.9 mean luma |
+| Least ambient light | `VICTORY_AMBIENT=<level>` (off) | everything outside direct sun near black (rays do not run) | at 0.3: left wall 7.3 -> 8.6, jacket 8.3 -> 8.9; **at 0.6: left wall 11.1 (+53 %), jacket 12.2 (+47 %)**, sunlit window unchanged, 1.67 fps (run `ambient-06`) |
 | Staging buffers marked in flight only when copied from | always | 14 needless waits for the card per frame | waits 342 -> 201 ms per frame (E7) |
 
 Not improved yet, and why:
