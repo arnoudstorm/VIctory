@@ -1372,6 +1372,13 @@ pub(crate) fn host_made<'a>(
 /// budget) these optional copies kept being made up to the floor while the
 /// card stood at 7.7 GB of 6.2, and the next allocation the title needed
 /// failed. The slots wait, as they do without room (nothing is faked).
+///
+/// None either while the PC's free physical memory is under
+/// `VICTORY_TEXTURE_MIN_FREE_MB` (1536 unless set; 0 turns it off): such a
+/// card's driver needs free pages, and a 16 GB laptop loading the world
+/// with 9,929 of these uploads in flight had 0.5-1.3 GB free when the
+/// driver could not close a command list, at 3.6 GB of the card's 7.5 GB
+/// budget. A PC with memory to spare never meets it.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1384,18 +1391,30 @@ pub(crate) fn room() -> bool {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .map(|[budget, used, ..]| (budget, used));
-    room_for(filled, limit, card, room_percent())
+    static MIN_FREE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let min_free = *MIN_FREE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIN_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
+    });
+    let pc = crate::host::available_physical_ram().map(|free| (free, min_free));
+    room_for(filled, limit, card, room_percent(), pc)
 }
 
 /// [`room`]'s decision: `filled` bytes of such copies, the byte `limit`
-/// if one is set, the card's `(budget, used)` if the system says, and the
-/// share of the budget in percent.
-fn room_for(filled: u64, limit: Option<u64>, card: Option<(u64, u64)>, percent: u64) -> bool {
+/// if one is set, the card's `(budget, used)` if the system says, the
+/// share of the budget in percent, and the PC's free physical memory with
+/// the least that must stay free (0: not looked at).
+fn room_for(filled: u64, limit: Option<u64>, card: Option<(u64, u64)>, percent: u64, pc: Option<(u64, u64)>) -> bool {
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     if let Some((budget, used)) = card
         && budget > 0
         && used >= budget
+    {
+        return false;
+    }
+    if let Some((free, least)) = pc
+        && least > 0
+        && free < least
     {
         return false;
     }
@@ -1420,26 +1439,36 @@ mod room_tests {
     #[test]
     fn a_card_past_its_budget_has_no_room() {
         // The 780M run: 0.8 GB of copies, the card at 7.7 GB of 6.2.
-        assert!(!room_for(GB * 8 / 10, None, Some((GB * 62 / 10, GB * 77 / 10)), 90));
+        assert!(!room_for(GB * 8 / 10, None, Some((GB * 62 / 10, GB * 77 / 10)), 90, None));
         // A byte limit does not override it either.
-        assert!(!room_for(GB / 2, Some(GB), Some((6 * GB, 6 * GB)), 90));
+        assert!(!room_for(GB / 2, Some(GB), Some((6 * GB, 6 * GB)), 90, None));
     }
 
     #[test]
     fn under_the_budget_nothing_changes() {
         // Under the floor: room, whatever the share.
-        assert!(room_for(GB, None, Some((10 * GB, 9 * GB)), 50));
+        assert!(room_for(GB, None, Some((10 * GB, 9 * GB)), 50, None));
         // Past the floor: the share of the budget decides.
-        assert!(room_for(3 * GB, None, Some((10 * GB, 8 * GB)), 90));
-        assert!(!room_for(3 * GB, None, Some((10 * GB, 9 * GB + GB / 2)), 90));
+        assert!(room_for(3 * GB, None, Some((10 * GB, 8 * GB)), 90, None));
+        assert!(!room_for(3 * GB, None, Some((10 * GB, 9 * GB + GB / 2)), 90, None));
         // A byte limit, under the budget.
-        assert!(room_for(GB / 2, Some(GB), Some((10 * GB, 5 * GB)), 90));
-        assert!(!room_for(GB, Some(GB), Some((10 * GB, 5 * GB)), 90));
+        assert!(room_for(GB / 2, Some(GB), Some((10 * GB, 5 * GB)), 90, None));
+        assert!(!room_for(GB, Some(GB), Some((10 * GB, 5 * GB)), 90, None));
         // No budget reported: the fixed cap.
-        assert!(room_for(3 * GB, None, None, 90));
-        assert!(!room_for(4 * GB, None, None, 90));
+        assert!(room_for(3 * GB, None, None, 90, None));
+        assert!(!room_for(4 * GB, None, None, 90, None));
         // A budget of 0 (not reported properly) is not "past the budget".
-        assert!(room_for(GB, None, Some((0, 0)), 90));
+        assert!(room_for(GB, None, Some((0, 0)), 90, None));
+        // Plenty of the PC's memory free: no change.
+        assert!(room_for(GB, None, Some((10 * GB, 5 * GB)), 90, Some((8 * GB, 3 * GB / 2))));
+    }
+
+    #[test]
+    fn a_pc_short_of_free_memory_has_no_room() {
+        // The 780M loading the world: 1.0 GB free, the card at 3.6 of 7.5 GB.
+        assert!(!room_for(GB * 3 / 2, None, Some((GB * 75 / 10, GB * 36 / 10)), 90, Some((GB, 3 * GB / 2))));
+        // 0 turns the look off.
+        assert!(room_for(GB * 3 / 2, None, Some((GB * 75 / 10, GB * 36 / 10)), 90, Some((GB, 0))));
     }
 }
 
