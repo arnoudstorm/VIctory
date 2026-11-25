@@ -663,21 +663,51 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
-            return 0;
+    // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+    let entry = |i: usize| unsafe {
+        (
+            *addresses.add(i) as usize,
+            (!pages.is_null()).then(|| *pages.add(i)),
+        )
+    };
+    // Ported from Project Flamingo (a79befd, as d549a33 left it): each
+    // mapped scatter address keeps its own host view (replacing one page of
+    // a larger view unmaps the whole view first, and its neighbours with it,
+    // while other title threads may read them); consecutive unmaps (null
+    // `pages`, or page 0) go in one call over those independent views.
+    let mut i = 0;
+    while i < n {
+        let (address, page) = entry(i);
+        let zero = page == Some(0);
+        let mut run = 1;
+        let batch = zero || pages.is_null();
+        while batch && i + run < n {
+            let (next, next_page) = entry(i + run);
+            if next != address + run * PAGE || (next_page == Some(0)) != zero {
+                break;
+            }
+            run += 1;
         }
+        let mapped = if zero || pages.is_null() {
+            XMemMapPhysicalPages(address as *mut c_void, run, std::ptr::null())
+        } else {
+            // SAFETY: `i < n`, and the title passes `n` pages when `pages`
+            // is not null; the run (one page here) starts at `i`.
+            XMemMapPhysicalPages(address as *mut c_void, run, unsafe { pages.add(i) })
+        };
+        if mapped.is_null() {
+            if run == 1 {
+                return 0;
+            }
+            // A run of unmaps crossing two placeholders: one at a time.
+            for k in i..i + run {
+                let (address, _) = entry(k);
+                if XMemMapPhysicalPages(address as *mut c_void, 1, std::ptr::null()).is_null() {
+                    return 0;
+                }
+            }
+        }
+        i += run;
     }
     1
 }
@@ -1211,6 +1241,86 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Scatter maps (ported from Project Flamingo): each address shows its
+    /// own page in its own host view, pages asked for out of order land
+    /// where they are named, a zero page unmaps only its own address, and a
+    /// run of unmaps goes in one call.
+    #[test]
+    fn scatter_maps_each_page_in_its_own_view_and_unmaps_runs() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        for k in 0..3 {
+            assert!(write_physical(&pages[k..], 0, &[b'0' + k as u8]));
+        }
+        let addresses = [at(0), at(1), at(2)];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, pages.as_ptr()), 1);
+        for k in 0..3 {
+            assert_eq!(query(at(k)).host.AllocationBase, at(k), "page {k} in its own view");
+            // SAFETY: mapped read-write.
+            assert_eq!(unsafe { at(k).cast::<u8>().read() }, b'0' + k as u8);
+        }
+        let addresses = [at(2), at(0)];
+        let swapped = [pages[0], pages[2]];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, swapped.as_ptr()), 1);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(2).cast::<u8>().read() }, b'0');
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(0).cast::<u8>().read() }, b'2');
+        let addresses = [at(1), at(2)];
+        let mixed = [0usize, pages[1]];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, mixed.as_ptr()), 1);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(2).cast::<u8>().read() }, b'1');
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, std::ptr::null()), 1);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Unmapping or remapping one scatter-mapped page does not unmap its
+    /// neighbour while another thread reads it (Project Flamingo d549a33).
+    #[test]
+    fn scatter_neighbor_unmap_does_not_fault_concurrent_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pages = allocate(4);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let addresses = [at(0), at(1), at(2), at(3)];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, pages.as_ptr()), 1);
+        let sentinel: u64 = 0x1122_3344_5566_7788;
+        let read_addr = at(2).wrapping_byte_add(PAGE - 0x110) as usize;
+        // SAFETY: page 2 is mapped read-write and aligned for `u64`.
+        unsafe { (read_addr as *mut u64).write(sentinel) };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !reader_stop.load(Ordering::Relaxed) {
+                // SAFETY: page 2 stays mapped while this thread runs.
+                let value = unsafe { (read_addr as *const u64).read_volatile() };
+                assert_eq!(value, sentinel);
+                reads += 1;
+            }
+            reads
+        });
+        let neighbor = [at(3)];
+        let (unmap_page, remap_page) = ([0usize], [pages[3]]);
+        for _ in 0..256 {
+            assert_eq!(XMemMapPhysicalPagesScatter(neighbor.as_ptr(), 1, unmap_page.as_ptr()), 1);
+            assert_eq!(XMemMapPhysicalPagesScatter(neighbor.as_ptr(), 1, remap_page.as_ptr()), 1);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("the reader must not fault") > 0);
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, std::ptr::null()), 1);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     #[test]
