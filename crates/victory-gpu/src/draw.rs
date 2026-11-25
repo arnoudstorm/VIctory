@@ -672,6 +672,14 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// Others recorded into the host list ([`crate::external`]): its heaps,
+    /// root signatures and pipeline are set again before the next draw or
+    /// dispatch (upstream 0b35b7f).
+    pub(crate) fn host_state_lost(&mut self) {
+        // No title heaps (0) differ from what the host list has, too.
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];

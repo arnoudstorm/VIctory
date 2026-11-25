@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -70,5 +72,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Opt-in (VICTORY_FFX_BUILTIN=1): the title's upscaler answered by ours.
+    #[cfg(windows)]
+    if fidelityfx::enabled() {
+        all.push(fidelityfx::module());
+    }
     all
 }
