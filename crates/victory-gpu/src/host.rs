@@ -2703,6 +2703,148 @@ fn late_line(frames: f64) {
     }
 }
 
+/// Synthetic workloads for memory lifetimes and submission cost on the
+/// host GPU: no title, no game data. They measure the whole process and
+/// card, so they run alone and on request:
+/// `cargo test -p victory-gpu --lib bench_tests -- --ignored --test-threads=1 --nocapture`.
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    /// The card's memory in use by this process and the PC's memory
+    /// shared with it, in bytes.
+    fn card_use(host: &Host) -> u64 {
+        host.video_memory().map_or(0, |[_, own, _, shared]| own + shared)
+    }
+
+    /// Buffers shared with the CPU (host copies of title memory are such
+    /// buffers) are given back when dropped, and when retired with nothing
+    /// in flight: 512 MB made and let go leaves the card and the process
+    /// where they were.
+    #[test]
+    #[ignore = "measures the whole process: run alone (see the module)"]
+    fn shared_buffers_are_given_back() {
+        let Some(host) = super::host() else { return };
+        const COUNT: usize = 64;
+        const SIZE: u64 = 8 << 20;
+        let (card0, ram0) = (card_use(host), process_private_bytes());
+        let buffers: Vec<_> = (0..COUNT).map(|_| host.shared_buffer(SIZE).expect("shared buffer")).collect();
+        // Touch every page, as a refresh does.
+        for (_, at) in &buffers {
+            // SAFETY: a mapped buffer of SIZE bytes.
+            unsafe { std::ptr::write_bytes(*at, 0x5a, SIZE as usize) };
+        }
+        let (card1, ram1) = (card_use(host), process_private_bytes());
+        let made = card1.saturating_sub(card0);
+        for (i, (buffer, _)) in buffers.into_iter().enumerate() {
+            // Half dropped, half through the retirement path.
+            if i % 2 == 0 { drop(buffer) } else { retire(buffer) }
+        }
+        let (card2, ram2) = (card_use(host), process_private_bytes());
+        let parked = RETIRED.lock().unwrap_or_else(|e| e.into_inner()).len();
+        eprintln!(
+            "retired list after letting go: {parked} parked; retirements dropped at once {}, parked {}",
+            RETIREMENTS[0].load(Ordering::Relaxed),
+            RETIREMENTS[1].load(Ordering::Relaxed)
+        );
+        assert_eq!(parked, 0, "retired buffers still parked with nothing in flight");
+        eprintln!(
+            "shared buffers: card +{} MB after {} x {} MB, {} MB left after letting go; process private +{} MB, {} MB left",
+            made >> 20,
+            COUNT,
+            SIZE >> 20,
+            card2.saturating_sub(card0) >> 20,
+            ram1.saturating_sub(ram0) >> 20,
+            ram2.saturating_sub(ram0) >> 20
+        );
+        assert!(made >= COUNT as u64 * SIZE * 9 / 10, "the card counted {made} bytes");
+        assert!(card2.saturating_sub(card0) <= 32 << 20, "{} bytes not given back", card2 - card0);
+    }
+
+    /// The same 512 MB made and dropped twice, no retirements: whether the
+    /// process memory left over after letting go grows from round to
+    /// round (a leak) or stays (memory the driver keeps for reuse).
+    #[test]
+    #[ignore = "measures the whole process: run alone (see the module)"]
+    fn process_memory_left_after_shared_buffers_does_not_grow() {
+        let Some(host) = super::host() else { return };
+        let ram0 = process_private_bytes();
+        let mut left = Vec::new();
+        for _ in 0..3 {
+            let buffers: Vec<_> = (0..64).map(|_| host.shared_buffer(8 << 20).expect("shared buffer")).collect();
+            for (_, at) in &buffers {
+                // SAFETY: a mapped buffer of 8 MB.
+                unsafe { std::ptr::write_bytes(*at, 0x5a, 8 << 20) };
+            }
+            drop(buffers);
+            left.push(process_private_bytes().saturating_sub(ram0) >> 20);
+        }
+        eprintln!("process private left after each round of 512 MB made and dropped: {left:?} MB");
+        // A leak grows by about 512 MB a round; what the driver keeps does not.
+        assert!(left[2] <= left[0] + 64, "grows from round to round: {left:?}");
+    }
+
+    /// What a retired object holds waits for the submission that was
+    /// current when it was retired, and goes once that one has finished.
+    #[test]
+    #[ignore = "moves the submission counters: run alone (see the module)"]
+    fn retired_objects_wait_for_their_submission() {
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started, finished) = (STARTED.load(Ordering::SeqCst), FINISHED.load(Ordering::SeqCst));
+        // A submission in flight.
+        STARTED.store(finished + 1, Ordering::SeqCst);
+        retire(Flag(gone.clone()));
+        bury(finished);
+        assert!(!gone.load(Ordering::SeqCst), "dropped while its submission ran");
+        bury(finished + 1);
+        assert!(gone.load(Ordering::SeqCst), "kept after its submission finished");
+        STARTED.store(started.max(finished + 1), Ordering::SeqCst);
+        FINISHED.store(finished + 1, Ordering::SeqCst);
+    }
+
+    /// The cost of a submission on its own: lists of one 4 KiB copy, run
+    /// and waited for one at a time; and the copy rate of 256 MB between
+    /// buffers shared with the CPU. Printed for the record.
+    #[test]
+    #[ignore = "a benchmark: run alone (see the module)"]
+    fn submission_and_copy_costs() {
+        let Some(host) = super::host() else { return };
+        let (src, src_at) = host.shared_buffer(256 << 20).expect("source");
+        let (dst, _) = host.shared_buffer(256 << 20).expect("destination");
+        // SAFETY: a mapped buffer of 256 MB.
+        unsafe { std::ptr::write_bytes(src_at, 0x3c, 256 << 20) };
+        const SMALL: u32 = 200;
+        let began = std::time::Instant::now();
+        for _ in 0..SMALL {
+            let list = host.new_list().expect("list");
+            // SAFETY: an open list and live buffers.
+            unsafe { list.list.CopyBufferRegion(&dst, 0, &src, 0, 4096) };
+            list.close();
+            host.execute(&[&list]);
+        }
+        let per = began.elapsed().as_secs_f64() * 1e3 / f64::from(SMALL);
+        let list = host.new_list().expect("list");
+        // SAFETY: as above.
+        unsafe { list.list.CopyBufferRegion(&dst, 0, &src, 0, 256 << 20) };
+        list.close();
+        let began = std::time::Instant::now();
+        host.execute(&[&list]);
+        let copy = began.elapsed().as_secs_f64();
+        eprintln!(
+            "submissions: {per:.3} ms each (one 4 KiB copy, waited for); copy between shared buffers: {:.2} GB/s (256 MB in {:.1} ms)",
+            0.25 / copy * 1.073_741_824,
+            copy * 1e3
+        );
+        assert!(per > 0.0 && copy > 0.0);
+    }
+}
+
 #[cfg(test)]
 mod telemetry_tests {
     use super::Telemetry;
