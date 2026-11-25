@@ -163,8 +163,31 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     // View memory: known from the runtime without asking Windows. One run
     // of a committed section is placed in the section's own heap; the rest
     // is turned down.
-    match cover(start as usize, len as usize) {
+    let covered = cover(start as usize, len as usize);
+    census(covered, start, len);
+    match covered {
         Cover::None => {}
+        Cover::Run(section, offset) if runs() => {
+            if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let host = crate::host::host()?;
+            return match place_in_run(&host.device, section, offset, start, len) {
+                Ok(placed) => {
+                    let at = if window { 0 } else { 2 };
+                    STATS[at].fetch_add(1, Ordering::Relaxed);
+                    STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+                    Some(placed)
+                }
+                Err(e) => {
+                    if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a run of a section not opened in place: a copy instead");
+                    }
+                    None
+                }
+            };
+        }
         Cover::Run(section, _) if section_committed(section) => {
             if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
                 STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -216,6 +239,52 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// How the asks [`place_for`] meets in view memory (the page pool) lie over
+/// the runtime's views, as counts and bytes: inside one view, one run over
+/// several views of one section, scattered over views or sections, and
+/// partly outside any view. Only counted: what can be placed per view
+/// (one heap per view, a buffer in it) is what lies inside one view.
+static CENSUS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn census(covered: Cover, start: u64, len: u64) {
+    let kind = match covered {
+        Cover::None => return,
+        Cover::Run(..) if within_one_view(start as usize, len as usize) => 0,
+        Cover::Run(..) => 1,
+        Cover::Scattered => 2,
+        Cover::Holes => 3,
+    };
+    CENSUS[kind * 2].fetch_add(1, Ordering::Relaxed);
+    CENSUS[kind * 2 + 1].fetch_add(len, Ordering::Relaxed);
+}
+
+/// Whether one view the runtime mapped holds all of `[at, at + len)`.
+fn within_one_view(at: usize, len: usize) -> bool {
+    within_one_view_in(&views().views, at, len)
+}
+
+fn within_one_view_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> bool {
+    views
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(&base, &(bytes, ..))| at.saturating_add(len.max(1)) <= base + bytes)
+}
+
+/// The views alive now: how many, their bytes, and how many of them are
+/// 1 MiB or more, for the census line.
+fn view_sizes() -> [u64; 3] {
+    let v = views();
+    let mut out = [0u64; 3];
+    for &(bytes, ..) in v.views.values() {
+        out[0] += 1;
+        out[1] += bytes as u64;
+        if bytes >= 1 << 20 {
+            out[2] += 1;
+        }
+    }
+    out
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -258,6 +327,107 @@ fn say() {
         s[6],
         s[7]
     );
+    let c: Vec<u64> = CENSUS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let [views, view_bytes, big] = view_sizes();
+    tracing::info!(
+        "view memory census since the start: {} asks inside one view ({} MB), {} as one run over views ({} MB), \
+         {} scattered ({} MB), {} partly outside views ({} MB); views alive: {views} ({} MB), {big} of 1 MiB or more",
+        c[0],
+        c[1] >> 20,
+        c[2],
+        c[3] >> 20,
+        c[4],
+        c[5] >> 20,
+        c[6],
+        c[7] >> 20,
+        view_bytes >> 20
+    );
+}
+
+/// A run of a reserved, pagefile-backed section (as the runtime makes the
+/// page pool) used in place through the second view: what the CPU writes
+/// through the title's view the card reads, and what the card writes the
+/// CPU reads through the title's view, with no copy between.
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEM_COMMIT, MapViewOfFile, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile,
+        VirtualAlloc,
+    };
+
+    #[test]
+    fn a_run_of_a_section_is_the_same_memory_for_the_card_and_the_title() {
+        let Some(host) = crate::host::host() else { return };
+        const SIZE: usize = 1 << 20;
+        const RUN: (u64, u64) = (64 << 10, 128 << 10); // offset, length
+        // SAFETY: a pagefile-backed reserved section of our own, one view of
+        // it as the title's, pages committed and written through that view.
+        let (section, title) = unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let title = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, SIZE).Value.cast::<u8>();
+            assert!(!title.is_null());
+            assert!(!VirtualAlloc(title.cast(), 256 << 10, MEM_COMMIT, PAGE_READWRITE).is_null());
+            for i in 0..(256usize << 10) {
+                title.add(i).write((i % 251) as u8);
+            }
+            (section, title)
+        };
+        keep_section(section as usize, SIZE as u64);
+        let placed = place_in_run(&host.device, section as usize, RUN.0, 0, RUN.1).expect("the run opened in place");
+        // The card reads the title's bytes.
+        let (out, out_at) = host.shared_buffer(RUN.1).expect("read-back buffer");
+        let list = host.new_list().expect("list");
+        // SAFETY: an open list and live buffers.
+        unsafe { list.list.CopyBufferRegion(&out, 0, &placed.buffer, placed.bias, RUN.1) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: our mapped buffer, the GPU done with it; the title view.
+        let read = unsafe { std::slice::from_raw_parts(out_at, RUN.1 as usize) };
+        let expected = unsafe { std::slice::from_raw_parts(title.add(RUN.0 as usize), RUN.1 as usize) };
+        assert!(read == expected, "the card read other bytes than the title's");
+        // The card writes; the title sees it through its own view.
+        let (src, src_at) = host.shared_buffer(4096).expect("source");
+        // SAFETY: our mapped buffer.
+        unsafe { std::ptr::write_bytes(src_at, 0xc3, 4096) };
+        let list = host.new_list().expect("list");
+        // SAFETY: an open list and live buffers.
+        unsafe { list.list.CopyBufferRegion(&placed.buffer, placed.bias + 8192, &src, 0, 4096) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the title view; the GPU is done.
+        let seen = unsafe { std::slice::from_raw_parts(title.add(RUN.0 as usize + 8192), 4096) };
+        assert!(seen.iter().all(|&b| b == 0xc3), "the title did not see the card's write");
+        assert!(unsafe { title.add(RUN.0 as usize + 8191).read() } == ((RUN.0 as usize + 8191) % 251) as u8);
+        drop(placed);
+        // SAFETY: our view and handle.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: title.cast() });
+            CloseHandle(section);
+        }
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::within_one_view_in;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn one_view_holds_only_what_lies_inside_it() {
+        // Two views next to each other: 0x10000+0x20000, 0x30000+0x10000.
+        let mut views = BTreeMap::new();
+        views.insert(0x1_0000usize, (0x2_0000usize, 1usize, 0u64));
+        views.insert(0x3_0000usize, (0x1_0000usize, 1usize, 0x2_0000u64));
+        assert!(within_one_view_in(&views, 0x1_0000, 0x2_0000));
+        assert!(within_one_view_in(&views, 0x2_8000, 0x8000));
+        assert!(!within_one_view_in(&views, 0x2_8000, 0x1_0000));
+        assert!(within_one_view_in(&views, 0x3_0000, 0x1_0000));
+        assert!(!within_one_view_in(&views, 0x4_0000, 1));
+        assert!(!within_one_view_in(&views, 0x8000, 0x100));
+    }
 }
 
 /// What a heap is opened on.
@@ -331,6 +501,95 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+    drop(v);
+    if runs() {
+        keep_section(section, bytes);
+    }
+}
+
+/// `VICTORY_INPLACE_RUNS=1` (with `VICTORY_INPLACE`): title memory that the
+/// runtime's views show as one run of one section (consecutive offsets
+/// over several views) is used in place through a second view of the
+/// whole section ([`place_in_run`]).
+///
+/// Why: the page pool is mapped page by page (95,695 views, 10 GB, six of
+/// them 1 MiB or more, in a world run on a Radeon 780M), so no window of
+/// it lies inside one view, and the host opens a heap only inside one
+/// view. In the same run 2,392 windows (939 MB) lay in one run of a
+/// section: in a view of the whole section such a run is one range of one
+/// view. Both views show the same pages, so the title's writes and the
+/// card's meet without copies; when the title maps other pages there, what
+/// was placed is let go ([`title_memory_freeing`]), as for other memory in
+/// place.
+fn runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// Per section the runtime made: its handle as the runtime knows it, our
+/// own handle of it (so a handle the runtime closes and Windows hands out
+/// again is never mapped by mistake), its bytes, and the base of our view
+/// of all of it (0 until first asked for).
+static SECOND_VIEWS: Mutex<Vec<(usize, usize, u64, usize)>> = Mutex::new(Vec::new());
+
+/// Keeps a handle of our own to `section`.
+fn keep_section(section: usize, bytes: u64) {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut ours = std::ptr::null_mut();
+    // SAFETY: duplicates a handle of this process into this process.
+    let ok = unsafe {
+        DuplicateHandle(GetCurrentProcess(), section as _, GetCurrentProcess(), &mut ours, 0, 0, DUPLICATE_SAME_ACCESS)
+    } != 0;
+    if !ok {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "no handle of our own to a section of title memory: its runs are copied");
+        return;
+    }
+    let mut views = SECOND_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    views.retain(|v| v.0 != section);
+    views.push((section, ours as usize, bytes, 0));
+}
+
+/// The base of our view of all of `section`, mapped on first use.
+fn second_view(section: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_ALL_ACCESS, MapViewOfFile};
+    let mut views = SECOND_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = views.iter_mut().find(|v| v.0 == section)?;
+    if entry.3 == 0 {
+        // SAFETY: our own handle of a pagefile-backed section, mapped whole.
+        let view = unsafe { MapViewOfFile(entry.1 as _, FILE_MAP_ALL_ACCESS, 0, 0, entry.2 as usize) };
+        if view.Value.is_null() {
+            tracing::warn!(error = %std::io::Error::last_os_error(), bytes = entry.2, "no second view of a section of title memory: its runs are copied");
+            return None;
+        }
+        entry.3 = view.Value as usize;
+        tracing::info!(bytes = entry.2, "a second view of a section of title memory, for its runs in place (VICTORY_INPLACE_RUNS)");
+    }
+    Some(entry.3)
+}
+
+/// One buffer over title memory `[start, start + len)` that the views show
+/// as one run of `section` from `offset` on: the 64 KiB pages of that run in
+/// our second view of the section, opened as a heap of their own.
+fn place_in_run(device: &ID3D12Device, section: usize, offset: u64, start: u64, len: u64) -> windows::core::Result<Placed> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    let base = second_view(section).ok_or_else(windows::core::Error::empty)? as u64;
+    let first = base + offset;
+    let at = first & !(K64 as u64 - 1);
+    let bytes = (first + len.max(1)).next_multiple_of(K64 as u64) - at;
+    // A view of a reserved section shows committed pages only where it
+    // commits them; the pages are the title's, committed already through
+    // its own views, so this charges nothing new.
+    // SAFETY: a range inside our view of the section.
+    if unsafe { VirtualAlloc(at as *const c_void, bytes as usize, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        return Err(windows::core::Error::from_thread());
+    }
+    let heap = open(device, From::Part(at as usize, bytes as usize))?;
+    let buffer = place(device, &heap, 0, bytes)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (first - at);
+    let _ = start;
+    Ok(Placed { buffer, heap, gpu, bias: first - at })
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
