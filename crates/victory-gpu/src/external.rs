@@ -23,20 +23,52 @@ const OUTPUT_STATE: u32 = 0x8;
 /// turn (far more than the frames the host has in flight).
 const PAIRS: u32 = 64;
 
-/// The upscaling pass: bilinear filtering of the colour's render-size
-/// corner onto the output's upscale-size corner, written as unordered
-/// access. Spatial only: no history, no use of depth or motion.
+/// The upscaling pass: the colour's render-size corner onto the output's
+/// upscale-size corner, written as unordered access. Spatial only: no
+/// history, no use of depth or motion. Two filters (`mode`): bilinear, or
+/// (`VICTORY_FFX_FILTER=bicubic`) Catmull-Rom bicubic from nine bilinear
+/// taps, sharpened against the bilinear result by `sharpen`
+/// (`VICTORY_FFX_SHARPEN`, 0.25) and kept inside the four nearest source
+/// texels, so the HDR colour neither rings nor goes negative.
 const SOURCE: &str = r#"
 #define ROOT "RootConstants(num32BitConstants=8, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 cbuffer sizes : register(b0) {
-    uint2 render;  // texels of the colour the title rendered
-    uint2 output;  // texels of the output to fill
-    float2 scale;  // render / colour texture size
-    uint2 pad;
+    uint2 render;   // texels of the colour the title rendered
+    uint2 output;   // texels of the output to fill
+    float2 scale;   // render / colour texture size
+    uint mode;      // 0 bilinear, 1 bicubic and sharpened
+    float sharpen;  // how much (bicubic only)
 };
 Texture2D<float4> colour : register(t0);
 RWTexture2D<float4> result : register(u0);
 SamplerState linear_clamp : register(s0);
+float4 tap(float2 texel, float2 size) {
+    return colour.SampleLevel(linear_clamp, texel / size, 0);
+}
+// Catmull-Rom through nine bilinear taps; `p` in texels of the colour texture.
+float4 bicubic(float2 p, float2 size) {
+    float2 t1 = floor(p - 0.5) + 0.5;
+    float2 f = p - t1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 t0 = t1 - 1.0;
+    float2 t3 = t1 + 2.0;
+    float2 t12 = t1 + w2 / w12;
+    float4 c = 0;
+    c += tap(float2(t0.x, t0.y), size) * w0.x * w0.y;
+    c += tap(float2(t12.x, t0.y), size) * w12.x * w0.y;
+    c += tap(float2(t3.x, t0.y), size) * w3.x * w0.y;
+    c += tap(float2(t0.x, t12.y), size) * w0.x * w12.y;
+    c += tap(float2(t12.x, t12.y), size) * w12.x * w12.y;
+    c += tap(float2(t3.x, t12.y), size) * w3.x * w12.y;
+    c += tap(float2(t0.x, t3.y), size) * w0.x * w3.y;
+    c += tap(float2(t12.x, t3.y), size) * w12.x * w3.y;
+    c += tap(float2(t3.x, t3.y), size) * w3.x * w3.y;
+    return c;
+}
 [RootSignature(ROOT)]
 [numthreads(8, 8, 1)]
 void upscale(uint3 id : SV_DispatchThreadID) {
@@ -47,7 +79,25 @@ void upscale(uint3 id : SV_DispatchThreadID) {
     // Clamp to the rendered corner's centre texels: never past it.
     float2 half_texel = 0.5 / float2(render);
     at = clamp(at, half_texel, 1.0 - half_texel);
-    result[id.xy] = colour.SampleLevel(linear_clamp, at * scale, 0);
+    float4 smooth = colour.SampleLevel(linear_clamp, at * scale, 0);
+    if (mode == 0) {
+        result[id.xy] = smooth;
+        return;
+    }
+    float2 size = float2(render) / scale;
+    float2 p = at * float2(render);
+    float4 c = bicubic(p, size);
+    c += (c - smooth) * sharpen;
+    // Inside the four nearest source texels.
+    int2 q = int2(floor(p - 0.5));
+    int2 last = int2(render) - 1;
+    float4 a = colour.Load(int3(clamp(q, int2(0, 0), last), 0));
+    float4 b = colour.Load(int3(clamp(q + int2(1, 0), int2(0, 0), last), 0));
+    float4 d = colour.Load(int3(clamp(q + int2(0, 1), int2(0, 0), last), 0));
+    float4 e = colour.Load(int3(clamp(q + int2(1, 1), int2(0, 0), last), 0));
+    float4 lo = min(min(a, b), min(d, e));
+    float4 hi = max(max(a, b), max(d, e));
+    result[id.xy] = max(clamp(c, lo, hi), 0.0);
 }
 "#;
 
@@ -117,6 +167,24 @@ fn pass() -> Result<&'static Pass, String> {
     })
     .as_ref()
     .map_err(Clone::clone)
+}
+
+/// The filter (`VICTORY_FFX_FILTER`: `bicubic`, else bilinear) and how
+/// much it sharpens (`VICTORY_FFX_SHARPEN`, 0.25; bicubic only).
+fn filter() -> (bool, f32) {
+    static SET: OnceLock<(bool, f32)> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let bicubic = std::env::var("VICTORY_FFX_FILTER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("bicubic"));
+        let sharpen = std::env::var("VICTORY_FFX_SHARPEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && (0.0..=2.0).contains(v))
+            .unwrap_or(0.25);
+        if bicubic {
+            tracing::info!(sharpen, "upscaling (ours): bicubic, sharpened");
+        }
+        (bicubic, sharpen)
+    })
 }
 
 /// A host texture's description, for the log: format, size, flags.
@@ -223,8 +291,8 @@ pub fn upscale(
         size[1],
         (render[0] as f32 / s.Width as f32).to_bits(),
         (render[1] as f32 / s.Height as f32).to_bits(),
-        0,
-        0,
+        u32::from(filter().0),
+        filter().1.to_bits(),
     ];
     let mut recorded = false;
     crate::list::with_state(list as This, |hl, state| {

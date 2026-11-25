@@ -605,6 +605,26 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Whether the card shares the PC's memory (integrated: one pool for
+        // the CPU and the GPU) and keeps the CPU's caches coherent: what an
+        // upload path that skips staging copies would need.
+        {
+            let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+            let asked = device.CheckFeatureSupport(
+                D3D12_FEATURE_ARCHITECTURE1,
+                (&raw mut arch).cast(),
+                size_of_val(&arch) as u32,
+            );
+            if asked.is_ok() {
+                tracing::info!(
+                    uma = arch.UMA.as_bool(),
+                    cache_coherent_uma = arch.CacheCoherentUMA.as_bool(),
+                    isolated_mmu = arch.IsolatedMMU.as_bool(),
+                    tile_based = arch.TileBasedRenderer.as_bool(),
+                    "host GPU memory architecture"
+                );
+            }
+        }
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
