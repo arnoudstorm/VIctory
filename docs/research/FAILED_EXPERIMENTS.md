@@ -80,3 +80,21 @@ quality, not correctness of the rest of the frame.
   fault with it. This is the work `fork-ray-tracing.md` lists as known
   gaps. It needs a synthetic test of one builder pass against known
   input on this card before any further game runs. Not a quick fix.
+
+## E13 (2026-11-25): builder checks offline and with DRED
+
+- Offline (`victory translate --validate --pipelines --list` over the
+  title's `XboxBvhBuilder.dll`, locally, nothing kept in the repo): all
+  52 builder programs translate, pass the DXIL validator, and get host
+  pipelines on the 780M. The defect is in what they compute (or in the
+  memory around them), not in translation or validation.
+- In-game with `-Dred` (`bvh-dred`, builder plus quarantine): **out of
+  memory** 48 s after the builder started (`0x8007000E`: no heap for
+  window tiles, then a host command list did not close), at 112 s.
+  E11's device removal came at the same point with private memory at
+  14.1 GB of 16 GB. So the builder runs cannot yet be told apart from
+  memory exhaustion on this laptop.
+- Next for lighting: either a GPU test of one builder stage on synthetic
+  input (needs the builder's input layout written down first: spilled
+  user-data table, root views, node format in `bvh.rs`), or first
+  lowering memory enough that a builder run is not starved.

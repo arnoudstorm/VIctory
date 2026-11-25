@@ -1,5 +1,9 @@
 # Next steps
 
+Status 2026-11-25 (E9-E13): in-place memory gives little; input lag is
+the frame time; the ray-traced lighting (builder) crashes the title,
+hangs the GPU, or runs out of memory first on this 16 GB laptop.
+
 0. **Smoothness (CPU bound, about 400 ms per frame):** finish in-place
    runs (`VICTORY_INPLACE_RUNS`, `inplace.rs`). They place ~1 GB of
    windows in place, but asks are still served by copied windows beside
