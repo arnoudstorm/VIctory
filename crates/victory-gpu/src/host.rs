@@ -2761,6 +2761,80 @@ mod bench_tests {
         assert!(card2.saturating_sub(card0) <= 32 << 20, "{} bytes not given back", card2 - card0);
     }
 
+    /// What the card and the process are charged for 512 MB of buffers
+    /// shared with the CPU, made as 64 KiB, 256 KiB and 4 MiB buffers (the
+    /// window grids): the cost of each buffer beyond its bytes. The 64 KiB
+    /// grid made 20,818 such buffers in one run.
+    #[test]
+    #[ignore = "measures the whole process: run alone (see the module)"]
+    fn cost_of_small_shared_buffers() {
+        let Some(host) = super::host() else { return };
+        const TOTAL: u64 = 512 << 20;
+        for size in [64u64 << 10, 256 << 10, 4 << 20] {
+            let count = TOTAL / size;
+            let (card0, ram0) = (card_use(host), process_private_bytes());
+            let began = std::time::Instant::now();
+            let buffers: Vec<_> = (0..count).map(|_| host.shared_buffer(size).expect("shared buffer")).collect();
+            let made_ms = began.elapsed().as_secs_f64() * 1e3;
+            let (card1, ram1) = (card_use(host), process_private_bytes());
+            let began = std::time::Instant::now();
+            drop(buffers);
+            let freed_ms = began.elapsed().as_secs_f64() * 1e3;
+            let card = card1.saturating_sub(card0);
+            let ram = ram1.saturating_sub(ram0);
+            eprintln!(
+                "{:>5} KiB x {count:>5}: card +{} MB ({:.2}x the bytes, {} KiB a buffer beyond its size); process +{} MB; made in {made_ms:.0} ms ({:.1} us each), freed in {freed_ms:.0} ms",
+                size >> 10,
+                card >> 20,
+                card as f64 / TOTAL as f64,
+                (card.saturating_sub(TOTAL) / count) >> 10,
+                ram >> 20,
+                made_ms * 1e3 / count as f64
+            );
+            assert!(card >= TOTAL * 9 / 10, "the card counted {card} bytes for {TOTAL}");
+        }
+    }
+
+    /// What a host list's command allocator keeps: the process's memory
+    /// after 64 lists recorded 20,000 copies each and ran, after they are
+    /// reset (allocators keep what they grew to), and after they are
+    /// dropped. The title keeps ~630 host lists alive.
+    #[test]
+    #[ignore = "measures the whole process: run alone (see the module)"]
+    fn what_host_lists_keep() {
+        let Some(host) = super::host() else { return };
+        let (src, _) = host.shared_buffer(1 << 20).expect("source");
+        let (dst, _) = host.shared_buffer(1 << 20).expect("destination");
+        let ram0 = process_private_bytes();
+        let lists: Vec<_> = (0..64)
+            .map(|_| {
+                let list = host.new_list().expect("list");
+                for i in 0..20_000u64 {
+                    // SAFETY: an open list and live buffers.
+                    unsafe { list.list.CopyBufferRegion(&dst, (i % 256) * 4096, &src, 0, 256) };
+                }
+                list.close();
+                host.execute(&[&list]);
+                list
+            })
+            .collect();
+        let recorded = process_private_bytes().saturating_sub(ram0);
+        for list in &lists {
+            list.reset();
+        }
+        let reset = process_private_bytes().saturating_sub(ram0);
+        drop(lists);
+        let dropped = process_private_bytes().saturating_sub(ram0);
+        eprintln!(
+            "64 host lists of 20,000 copies: +{} MB recorded and run, +{} MB after their reset, +{} MB after they are dropped ({} KiB a list kept over a reset)",
+            recorded >> 20,
+            reset >> 20,
+            dropped >> 20,
+            (reset >> 10) / 64
+        );
+        assert!(dropped <= recorded);
+    }
+
     /// The same 512 MB made and dropped twice, no retirements: whether the
     /// process memory left over after letting go grows from round to
     /// round (a leak) or stays (memory the driver keeps for reuse).
