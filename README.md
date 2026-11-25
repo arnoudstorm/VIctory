@@ -10,6 +10,9 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+> **AMD RDNA3 (RX 7000 series):** this fork's `main` also carries the AMD and
+> relay fixes and a launcher tested on an RX 7600 XT. See [RDNA3.md](RDNA3.md).
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
