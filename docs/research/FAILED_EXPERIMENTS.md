@@ -56,3 +56,27 @@ quality, not correctness of the rest of the frame.
   page mapping has no host equivalent. Cutting it needs the copies to be
   skipped where nothing changed (the write watch already does this), not
   in-place memory.
+
+## E10 (2026-11-25): ray-tracing structure builder on (`VICTORY_BVH_BUILDER=1`), run `bvh-on`: the title crashes
+
+- Hypothesis: with the builder running, the title's ray-traced indirect
+  light and shadows work, and shadowed areas stop being black.
+- Actual: the builder now runs on this card ("all of its programs have
+  host pipelines", 53 pipelines; `fork-ray-tracing.md` said some were
+  refused). The first world frame took 11 s, and 22 s after the builder
+  started the title crashed in its own code: access violation reading
+  through `rcx = 0x500150010000d000`, a bounds-like bit pattern, not a
+  pointer. The title's crash reporter tried to upload (blocked by
+  VIctory's network policy). Same signature as run 98: builder stores land
+  on the title's own objects.
+
+## E11: builder on with its stores kept off title memory (`VICTORY_BVH_QUARANTINE=1`), run `bvh-quarantine`: device removed
+
+- Actual: no title crash, but the **host GPU device was removed** at the
+  first world frame (1 submission in flight, no breadcrumbs). Private
+  memory peaked at 14.1 GB, free RAM 5 MB.
+- Conclusion: the ray-traced lighting is blocked by the builder and
+  traversal emulation itself: wrong stores without quarantine, a GPU
+  fault with it. This is the work `fork-ray-tracing.md` lists as known
+  gaps. It needs a synthetic test of one builder pass against known
+  input on this card before any further game runs. Not a quick fix.

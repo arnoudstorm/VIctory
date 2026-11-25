@@ -393,9 +393,14 @@ impl Hub {
         let hub = Hub::new(source);
         hub.poll();
         std::thread::spawn(move || {
+            let mut said = std::time::Instant::now();
             loop {
                 std::thread::sleep(POLL);
                 hub.poll();
+                if said.elapsed() >= std::time::Duration::from_secs(5) {
+                    said = std::time::Instant::now();
+                    input_line();
+                }
             }
         });
         hub
@@ -507,6 +512,10 @@ impl State {
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
             slot.sequence += 1;
+            CALLS[7].fetch_add(1, Ordering::Relaxed);
+            if matches!(value, Value::Pad(_)) {
+                CALLS[6].fetch_add(1, Ordering::Relaxed);
+            }
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
             }
@@ -612,6 +621,34 @@ extern "system" fn timestamp(_: This) -> u64 {
     now()
 }
 
+/// Since the last input line: the title's calls for the current reading,
+/// for next readings (found, none newer, reference too old), previous and
+/// temporal readings; readings made (pads, then all); and the summed age
+/// in microseconds of the current readings handed out.
+static CALLS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Logs what the title asked of input since the last line: whether it
+/// takes the newest reading or walks them one by one (which falls behind
+/// when frames are slow), and how old what it got was.
+fn input_line() {
+    let c: Vec<u64> = CALLS.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    if c.iter().all(|&v| v == 0) {
+        return;
+    }
+    tracing::info!(
+        current = c[0],
+        next_found = c[1],
+        next_none = c[2],
+        next_too_old = c[3],
+        previous = c[4],
+        temporal = c[5],
+        pad_readings_made = c[6],
+        readings_made = c[7],
+        current_age_ms_avg = format_args!("{:.1}", if c[0] > 0 { c[8] as f64 / c[0] as f64 / 1000.0 } else { 0.0 }),
+        "input in the last 5 s: what the title asked for"
+    );
+}
+
 extern "system" fn current_reading(
     this: This,
     kind: u32,
@@ -644,6 +681,10 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
+    CALLS[0].fetch_add(1, Ordering::Relaxed);
+    if let Some(r) = found {
+        CALLS[8].fetch_add(now().saturating_sub(r.timestamp), Ordering::Relaxed);
+    }
     hand(out, found)
 }
 
@@ -677,6 +718,9 @@ fn relative(
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
+        if forward {
+            CALLS[3].fetch_add(1, Ordering::Relaxed);
+        }
         return fail(out, REFERENCE_TOO_OLD);
     }
     let wanted = |r: &&Ref| r.kind() & kind != 0;
@@ -692,6 +736,12 @@ fn relative(
             .filter(|r| r.sequence < reference.sequence)
             .find(wanted)
     };
+    let at = match (forward, found.is_some()) {
+        (true, true) => 1,
+        (true, false) => 2,
+        (false, _) => 4,
+    };
+    CALLS[at].fetch_add(1, Ordering::Relaxed);
     hand(out, found)
 }
 extern "system" fn next_reading(
@@ -725,6 +775,7 @@ extern "system" fn temporal_reading(
     };
     let state = hub.state();
     let history = &state.slots[index].history;
+    CALLS[5].fetch_add(1, Ordering::Relaxed);
     hand(out, history.iter().rev().find(|r| r.timestamp <= time))
 }
 

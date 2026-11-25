@@ -107,3 +107,18 @@ the card cap lowered to 256 MB for memory, and tiled windows. The
 reported display mode is ignored by the title (`resolution-hdr-780m.md`).
 What is left is structural: stop copying title memory the card can read
 in place.
+
+## E12 (2026-11-25): controller input lag (counters in `gameinput.rs`, run `bvh-on`)
+
+- Change: counters only. Per 5 s, the title's calls for the current,
+  next, previous and temporal readings, references too old, readings
+  made, and the age of the current readings handed out.
+- Result: in the world the title asks for the **current** reading every
+  frame (36-294 calls per 5 s) and for the next one after it, which is
+  never there (`next_none` = half the calls). It never walked old
+  readings and never got "reference too old". VIctory polls the pad
+  every 8 ms and hands out the newest state, so it adds at most about
+  8 ms.
+- Conclusion: the lag is the frame time. The title reads the pad once
+  per frame, and a world frame takes ~700 ms to render and show, so a
+  press shows up after 0.7-1.4 s. Only a higher frame rate fixes it.
