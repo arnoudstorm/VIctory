@@ -122,3 +122,50 @@ in place.
 - Conclusion: the lag is the frame time. The title reads the pad once
   per frame, and a world frame takes ~700 ms to render and show, so a
   press shows up after 0.7-1.4 s. Only a higher frame rate fixes it.
+
+## E14 (2026-11-25): where the windows' duplicate memory is (run `window-shapes`, counters only)
+
+Windows outside buffers: 2,031 MB over 1,368 MB of title memory, so
+about 660 MB is held twice. By shape: tails 582 MB over 554 MB, grid
+windows 1,449 MB over 1,043 MB (about 406 MB grid-on-grid), and about
+229 MB where tails and grid windows overlap. Grid windows overlap
+because descriptor slots name their window by their own range (`find`):
+the pass that refreshes a slot must find the same copy again, so two
+slots over overlapping ranges get two windows. Sharing one window would
+mean refreshing the copy a slot holds instead of looking it up again
+(14 call sites of `shadow::find`). Not done: a wrong refresh means
+stale data on screen.
+
+## E15: 4 MiB windows over tiles (`VICTORY_WINDOW_KB=4096`, run `window-4m`)
+
+- Hypothesis: with tiled windows (only copied tiles hold memory), one
+  window per 4 MiB cell removes the duplicates at little cost.
+- Actual, against `window-shapes`:
+
+| | 256 KiB grid | 4 MiB grid |
+|---|---|---|
+| tiles mapped (memory held) | 1,522 MB | 1,906 MB |
+| GPU memory | 7,189 MB | 7,245 MB |
+| moves per frame | 90 ms | 42 ms |
+| CPU per frame | 519 ms | 318 ms |
+| frame | 806 ms (1.75 fps) | 672 ms (1.90 fps) |
+
+  Faster (17 %, just beyond the 15 % spread), but **more** memory held
+  (+384 MB of tiles). It is an option for speed, not for memory. The
+  run script keeps 256 KiB.
+
+## E16: the title's own graphics settings lowered (run `low-settings`)
+
+- Change: the title's settings file (`storage/settings/settings.xml` in
+  VIctory's data folder, not in the repo; original kept beside it as
+  `settings.original.xml`): `lodScale` 1.0 -> 0.6, `grassLod` 1.0 ->
+  0.5, `maxTexUpgradesPerFrame` 5 -> 2, motion blur off, alpha-tinted
+  and particle shadows off, `vehicleHDCount` 2 -> 1, water reflections
+  512x256 -> 256x128, fullscreen 3840x2160 -> 1920x1080. HDR was
+  already off (`hdr false`; VIctory also answers SDR).
+- Actual: no measurable change. GPU memory 7,190 vs 7,189 MB, window
+  tiles 1,498 vs 1,522 MB, draws per frame 4,323 vs 4,281, frame 731 vs
+  806 ms (inside the spread), free RAM down to 3 MB. The console build
+  most likely uses its fixed Series S preset and ignores these values.
+  Saves exist (a 252 KB story save `SARC0015` from 08:01, a profile, the
+  settings profile); they were not touched.

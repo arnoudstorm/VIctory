@@ -896,6 +896,15 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    let o = crate::shadow::window_overlap();
+    tracing::info!(
+        "memory, windows by shape: tails {:.0} MB over {:.0} MB of title memory, grid windows {:.0} MB over {:.0} MB;          both kinds together over {:.0} MB",
+        mb(o[0]),
+        mb(o[1]),
+        mb(o[2]),
+        mb(o[3]),
+        mb(o[4]),
+    );
 }
 
 /// Microseconds since the first call.

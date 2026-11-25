@@ -3106,6 +3106,30 @@ pub(crate) fn window_cover() -> u64 {
     cover(loose.keys().copied())
 }
 
+/// For the memory line: where the windows' overlap is, by shape. Tails
+/// end at their 4 MiB cell's end and begin above its start; the others
+/// are grid windows. Bytes and title memory covered of each kind, then of
+/// both: what tails cover twice among themselves, what grid windows do,
+/// and what lies in both kinds.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_overlap() -> [u64; 5] {
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let is_tail = |&(start, bytes): &(u64, u64)| {
+        let (cell, len) = window_of(start, start + bytes, WINDOW);
+        start != cell && start + bytes == cell + len
+    };
+    let tails: Vec<(u64, u64)> = loose.keys().copied().filter(is_tail).collect();
+    let grids: Vec<(u64, u64)> = loose.keys().copied().filter(|k| !is_tail(k)).collect();
+    let sum = |w: &[(u64, u64)]| w.iter().map(|w| w.1).sum::<u64>();
+    [
+        sum(&tails),
+        cover(tails.iter().copied()),
+        sum(&grids),
+        cover(grids.iter().copied()),
+        cover(loose.keys().copied()),
+    ]
+}
+
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
 /// byte once.
 #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
