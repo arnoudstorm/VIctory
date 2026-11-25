@@ -87,6 +87,13 @@ Frame rate was 1.5-1.6 fps (613-685 ms), against 0.9-1.2 fps
 (845-1056 ms) without the switch, because the 20 dropped passes and the
 FSR4 DLL's work are gone.
 
+**Longer run `ffx-every` (420 s, switch on):** the world rendered from
+frame 1724 to past 2155 (5 min 40 s, until the harness stopped it) and
+reached gameplay (control prompt, the camera moved). The every-present
+black detector found no black frame after the cut into the world. All 63
+saved world frames are lit (mean 17.9-229.6) and each differs from the
+one before. There was no device removal.
+
 Still open, not caused by this change: faces under backlight look very
 dark (frame 2527), and some shots are washed out to near white (frame
 2505). It is not yet known whether these are intended fades or exposure

@@ -29,3 +29,18 @@ Logs and frames are outside the repo (session notes folder).
   33-231). The title's dispatch names colour 1280x720 R16G16B16A16_FLOAT
   and output 1920x1080 R9G9B9E5 (unordered access). 1.5-1.6 fps. No
   device removal. The run was stopped by the harness at 240 s.
+
+## E4: `ffx-every` (`VICTORY_FFX_BUILTIN=1`, 420 s)
+
+- Change: none to the code (`1272861`); a longer run.
+- Hypothesis: with the upscaler filled, the world keeps rendering.
+- Actual: the world ran from frame 1724 (12:02:43) to past 2155
+  (12:08:23), when the harness stopped it. The game reached **gameplay**
+  (control prompt, camera moved). Black detector: one black frame at the
+  cut (1723), none after it. 1.4-1.6 fps in the world (645-717 ms).
+  Private memory peaked at 12.5 GB, free RAM at least 7 MB, no device
+  removal.
+- Note: `-FlickerFrames 2480-2800` saved nothing, because the run never
+  reached frame 2480. The capture folder also keeps older runs' frames
+  above the new run's last frame; filter by the log's "frame saved"
+  lines.
