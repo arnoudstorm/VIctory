@@ -84,6 +84,11 @@ impl Heap {
         {
             return None;
         }
+        // `mirror` queues only while the host heap is unset, under the lock
+        // that makes it, so nothing waits in `pending` once it is set.
+        if let Some(h) = self.host.get() {
+            return h.as_ref();
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // A recorder can take the fast path as soon as the OnceLock is
         // initialized. Publish only after replaying the queued writes.
