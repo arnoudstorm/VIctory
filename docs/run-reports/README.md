@@ -2,6 +2,7 @@
 
 Written by run_report.py while the game runs. Newest first.
 
+- [run-2026-11-25-0544](run-2026-11-25-0544.md): No failure seen yet.
 - [run-2026-11-25-0541](run-2026-11-25-0541.md): No failure seen yet.
 - [run-2026-11-25-0528](run-2026-11-25-0528.md): The GPU device was removed with no out-of-memory before it; see the error lines.
 - [run-2026-11-25-0526](run-2026-11-25-0526.md): The GPU device was removed with no out-of-memory before it; see the error lines.
