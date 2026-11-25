@@ -81,16 +81,35 @@ Process memory one minute into the world (memory map line):
 
 ## Fixes, ranked by measured effect
 
-1. **Age out windows that only descriptor slots hold** (memory, crashes):
-   a window no list has used for N frames and no slot read through a
-   table goes; a later read makes it again from title memory (it is a
-   copy). Expected: most of the 2.6 GB held by slots.
-2. **Shorten the submission lock** (frame time): record outside it and
-   take it only to submit.
-3. **Small-block churn** (RAM, CPU): pool the sub-4 KiB allocations of
-   recording.
-4. **Texture backlog**: upload the slots draws read first (needs knowing
+A first ranking put two fixes on top that the code and the logs rule out:
+
+- **Not a fix: ageing out windows that descriptor slots hold.** Shaders
+  that pick buffers by a computed index can read any buffer view of the
+  heap, so `heap_buffers` keeps every view's copy valid and refreshes it
+  each frame. A window freed under a slot would leave that slot null and
+  such shaders reading zeros: a silent wrong result. The 2.6 GB is the
+  cost of copying title memory for bindless reads, not a leak. What
+  removes it is using title memory in place (in place covers the
+  windows in private memory; the page pool's views are scattered).
+- **Not a fix: the "submission lock" wait.** The 1,049 ms a frame counted
+  there is the time from a submission's call to the start of its
+  preparing, which includes waiting for flights to land. Of it, 897 ms is
+  "title memory read": a submission reads title memory that a submission
+  in flight writes (8.5 times a frame). That wait keeps what the title
+  reads correct. In the same frames the relay thread waited 921 ms for
+  the card with nothing to land: the 780M runs for most of each 1.2 s
+  world frame. The world is GPU-bound now.
+
+What remains, by effect:
+
+1. **GPU time per frame** (frame rate): find the submissions and shaders
+   that take the card's ~0.9 s a frame (`VICTORY_GPU_TIMING=1` names the
+   slowest commands per list) and fix the costly translations.
+2. **Small-block churn** (RAM, CPU): 921,320 blocks under 4 KiB.
+3. **Texture backlog**: upload the slots draws read first (needs knowing
    which indices shaders read; today the most recently written go first).
+4. **Memory for bindless copies**: more title memory in place (the page
+   pool's views), which needs placed buffers that span views.
 
 Changes made so far are listed in `docs/report-radeon-780m.md` and in the
 commit log of this branch.
