@@ -2,7 +2,7 @@
 
 Written by run_report.py while the game runs. Newest first.
 
-- [run-2026-11-25-0703](run-2026-11-25-0703.md): No failure seen yet.
+- [run-2026-11-25-0703](run-2026-11-25-0703.md): A crash in the title or in VIctory; see the error lines.
 - [run-2026-11-25-0655](run-2026-11-25-0655.md): No failure seen yet.
 - [run-2026-11-25-0653](run-2026-11-25-0653.md): The GPU device was removed with no out-of-memory before it; see the error lines.
 - [run-2026-11-25-0650](run-2026-11-25-0650.md): The GPU device was removed with no out-of-memory before it; see the error lines.
