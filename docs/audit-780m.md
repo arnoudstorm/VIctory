@@ -71,8 +71,9 @@ Process memory one minute into the world (memory map line):
 
 ## Validation done
 
-- `cargo test --workspace` on `laptop/780m` with the GPU tests on the
-  780M: see the section below.
+- `cargo test --workspace` on `laptop/780m`, GPU and shader tests on the
+  780M itself: 511 passed, 0 failed, 8 ignored (before the overlay); the
+  GPU crate after it: 120 passed, 1 ignored.
 - Debug layer, GPU-based validation and DRED exist as switches
   (`VICTORY_D3D12_DEBUG`, `VICTORY_D3D12_GBV`, `VICTORY_D3D12_DRED`); runs
   with them are slower than the title's watchdog allows without
