@@ -131,6 +131,28 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// Whether the runtime made `section` with `SEC_COMMIT`.
+fn section_committed(section: usize) -> bool {
+    views().sections.iter().any(|&(s, _, committed)| s == section && committed)
+}
+
+/// One buffer over title memory `[start, start + len)`, which a committed
+/// section's views show as one run: the 64 KiB pages of the views that
+/// hold it are opened by address as a heap of their own (only those bytes
+/// count against the card's budget; opening the whole section as one heap
+/// counted all 6.1 GiB and the card refused every allocation after it).
+/// Views the title maps anew let what is placed over them go
+/// ([`title_memory_freeing`]).
+fn place_in_section(device: &ID3D12Device, start: u64, len: u64) -> windows::core::Result<Placed> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let heap = open(device, From::Part(at as usize, bytes as usize))?;
+    let buffer = place(device, &heap, 0, bytes)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Placed { buffer, heap, gpu, bias: start - at })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -138,10 +160,36 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // View memory: known from the runtime without asking Windows. One run
+    // of a committed section is placed in the section's own heap; the rest
+    // is turned down.
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        Cover::Run(section, _) if section_committed(section) => {
+            if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let host = crate::host::host()?;
+            return match place_in_section(&host.device, start, len) {
+                Ok(placed) => {
+                    let at = if window { 0 } else { 2 };
+                    STATS[at].fetch_add(1, Ordering::Relaxed);
+                    STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+                    Some(placed)
+                }
+                Err(e) => {
+                    if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "section memory not opened in place: a copy instead");
+                    }
+                    None
+                }
+            };
+        }
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);

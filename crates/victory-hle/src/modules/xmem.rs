@@ -34,6 +34,19 @@ use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
+/// Whether the title's physical pages are one committed section
+/// (`SEC_COMMIT`): always under Wine; on Windows with
+/// `VICTORY_POOL_COMMIT=1`. The GPU side can then open the section as a
+/// heap and use the title's pages in place instead of copying them (on a
+/// card that shares the PC's memory, those copies are what fills it). It
+/// charges the whole section to the commit limit at once (6.1 GiB).
+pub(crate) fn pool_committed() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        on_wine() || std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1")
+    });
+    *ON
+}
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
     static WINE: LazyLock<bool> = LazyLock::new(|| {
@@ -410,7 +423,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | if pool_committed() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -430,7 +443,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, pool_committed());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -746,8 +759,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    if pool_committed() {
+        return true; // the section is committed whole
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
