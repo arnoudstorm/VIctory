@@ -411,6 +411,42 @@ mod run_tests {
 }
 
 #[cfg(test)]
+mod alias_tests {
+    use super::{K64, Views};
+    use std::collections::BTreeMap;
+
+    fn views() -> Views {
+        Views { views: BTreeMap::new(), sections: Vec::new(), pages: BTreeMap::new() }
+    }
+
+    #[test]
+    fn a_page_shown_by_two_views_is_aliased_and_stops_being_when_one_goes() {
+        let k = K64;
+        let mut v = views();
+        // Section 7: view A shows pages 0-2 at 0x100000; view B shows page 1 at 0x900000.
+        for (at, view) in [(0x10_0000usize, (3 * k, 7usize, 0u64)), (0x90_0000, (k, 7, k as u64))] {
+            v.views.insert(at, view);
+            v.count(view, true);
+        }
+        assert!(v.aliased(0x10_0000 + k, 16), "page 1 through A");
+        assert!(v.aliased(0x90_0000, k), "page 1 through B");
+        assert!(!v.aliased(0x10_0000, k), "page 0 is A's alone");
+        assert!(!v.aliased(0x10_0000 + 2 * k, k), "page 2 is A's alone");
+        assert!(v.aliased(0x10_0000, 3 * k), "a range over page 1");
+        // B goes: nothing is aliased any more.
+        let b = v.views.remove(&0x90_0000).unwrap();
+        v.count(b, false);
+        assert!(!v.aliased(0x10_0000, 3 * k));
+        assert!(v.pages.values().all(|&n| n == 1));
+        // The same page of another section is not an alias.
+        let c = (k, 8usize, k as u64);
+        v.views.insert(0xA0_0000, c);
+        v.count(c, true);
+        assert!(!v.aliased(0x10_0000 + k, 16));
+    }
+}
+
+#[cfg(test)]
 mod census_tests {
     use super::within_one_view_in;
     use std::collections::BTreeMap;
@@ -487,9 +523,58 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// By (section, offset of a 64 KiB page in it): how many views show
+    /// that page. A page shown by two or more views is written through one
+    /// and read through another, which the guards cannot see ([`aliased`]).
+    pages: BTreeMap<(usize, u64), u32>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new(), pages: BTreeMap::new() });
+
+impl Views {
+    /// Counts the pages of a view in or out of [`Views::pages`].
+    fn count(&mut self, (len, section, offset): (usize, usize, u64), add: bool) {
+        let first = offset / K64 as u64;
+        let last = (offset + len.max(1) as u64 - 1) / K64 as u64;
+        for page in first..=last {
+            let key = (section, page);
+            if add {
+                *self.pages.entry(key).or_insert(0) += 1;
+            } else if let Some(n) = self.pages.get_mut(&key) {
+                *n -= 1;
+                if *n == 0 {
+                    self.pages.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Whether any page of `[at, at + len)` that the views show is shown
+    /// by another view too.
+    fn aliased(&self, at: usize, len: usize) -> bool {
+        let end = at.saturating_add(len.max(1));
+        let first = self.views.range(..=at).next_back().filter(|(base, v)| *base + v.0 > at).map(|(b, v)| (*b, *v));
+        first
+            .into_iter()
+            .chain(self.views.range(at.saturating_add(1)..end).map(|(b, v)| (*b, *v)))
+            .any(|(base, (bytes, section, offset))| {
+                // The part of this view inside the range, as section pages.
+                let from = at.max(base) - base;
+                let to = end.min(base + bytes) - base;
+                let first = (offset + from as u64) / K64 as u64;
+                let last = (offset + to as u64 - 1) / K64 as u64;
+                (first..=last).any(|page| self.pages.get(&(section, page)).is_some_and(|&n| n >= 2))
+            })
+    }
+}
+
+/// Whether title memory `[at, at + len)` lies, at least in part, on pages
+/// that another view of the same section shows too: writes through that
+/// other view reach this memory with no guard of ours to see them.
+pub(crate) fn aliased(at: usize, len: usize) -> bool {
+    let v = views();
+    !v.pages.is_empty() && v.aliased(at, len)
+}
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -595,7 +680,11 @@ fn place_in_run(device: &ID3D12Device, section: usize, offset: u64, start: u64, 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    let mut v = views();
+    if let Some(old) = v.views.insert(at, (len, section, offset)) {
+        v.count(old, false);
+    }
+    v.count((len, section, offset), true);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -610,7 +699,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        if let Some(old) = v.views.remove(&base) {
+            v.count(old, false);
+        }
     }
 }
 

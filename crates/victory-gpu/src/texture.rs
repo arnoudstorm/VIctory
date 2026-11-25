@@ -702,7 +702,13 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // Pages another view shows too are written through that view
+            // with no guard of ours to see it: such a texture is hashed at
+            // every check. The start screen's video is decoded into a ring of
+            // three textures through other views: hashed every eighth frame,
+            // each slot showed the frame of its last ring cycle for up to
+            // eight frames, a strobe of up to 29 reversals a second.
+            if unwritten && !turn && !crate::inplace::aliased(start, size) {
                 return 0;
             }
         }
@@ -864,6 +870,96 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
+}
+
+/// Diagnostics, for the start-screen strobe: title-filled textures a
+/// submission read (uploaded or found unchanged), each with a fingerprint
+/// of its memory at that moment. At the next present ([`check_reads_at_present`])
+/// each is fingerprinted again: a change means the title wrote the texture
+/// after VIctory read it for this frame, so the frame showed older contents
+/// than the console's GPU, which reads at execution, a frame or two later.
+#[cfg(feature = "diagnostics")]
+static READ_THIS_FRAME: std::sync::Mutex<Vec<(std::sync::Arc<Staging>, u64)>> = std::sync::Mutex::new(Vec::new());
+/// Since the start: textures checked at a present, and of them changed
+/// between the submission that read them and that present.
+#[cfg(feature = "diagnostics")]
+pub(crate) static READ_LATE: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Per staging buffer (by address): the fingerprint of its memory when it
+/// was last uploaded. A submission that skips the upload because nothing
+/// seemed changed, while the memory's fingerprint differs from that one,
+/// is a change the write watch and the guards missed ([`MISSED`]).
+#[cfg(feature = "diagnostics")]
+static UPLOADED_PRINT: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+/// Since the start: uploads skipped as unchanged, and of them with memory
+/// that had changed since the last upload.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MISSED: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// At submission, after the staging refresh: `uploading` says whether this
+/// submission copies the staging buffer into the host texture.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_upload_decision(staging: &std::sync::Arc<Staging>, uploading: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (at, len) = staging.memory();
+    let print = fingerprint(at as u64, len as u64);
+    let key = std::sync::Arc::as_ptr(staging) as usize;
+    let mut prints = UPLOADED_PRINT.lock().unwrap_or_else(|e| e.into_inner());
+    let prints = prints.get_or_insert_with(Default::default);
+    if uploading {
+        prints.insert(key, print);
+        return;
+    }
+    MISSED[0].fetch_add(1, Relaxed);
+    if prints.get(&key).is_some_and(|&p| p != print) {
+        let n = MISSED[1].fetch_add(1, Relaxed);
+        if n < 300 {
+            tracing::info!(
+                frame = crate::queue::presented() + 1,
+                memory = format_args!("{at:#x}+{len:#x}"),
+                "title texture changed since its last upload, but the upload was skipped as unchanged"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_read_at_submission(staging: &std::sync::Arc<Staging>) {
+    let (at, len) = staging.memory();
+    let print = fingerprint(at as u64, len as u64);
+    let mut read = READ_THIS_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    if read.len() < 256 && !read.iter().any(|(s, _)| std::sync::Arc::ptr_eq(s, staging)) {
+        read.push((staging.clone(), print));
+    }
+}
+
+/// At a present: how many of the textures read since the last present
+/// changed after they were read; logged for frames where any did (the
+/// first 400 such frames).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_reads_at_present(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let read = std::mem::take(&mut *READ_THIS_FRAME.lock().unwrap_or_else(|e| e.into_inner()));
+    if read.is_empty() {
+        return;
+    }
+    let changed: Vec<(usize, usize)> = read
+        .iter()
+        .filter(|(s, print)| {
+            let (at, len) = s.memory();
+            fingerprint(at as u64, len as u64) != *print
+        })
+        .map(|(s, _)| s.memory())
+        .collect();
+    READ_LATE[0].fetch_add(read.len() as u64, Relaxed);
+    READ_LATE[1].fetch_add(changed.len() as u64, Relaxed);
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !changed.is_empty() && LOGGED.fetch_add(1, Relaxed) < 400 {
+        let sizes: Vec<String> = changed.iter().take(6).map(|(at, len)| format!("{at:#x}+{len:#x}")).collect();
+        tracing::info!(frame, read = read.len(), changed = changed.len(), ?sizes, "title textures written after this frame read them");
+    }
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of

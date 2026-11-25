@@ -5296,7 +5296,12 @@ impl HostList {
                 .texture_uploads
                 .iter()
                 .filter_map(|(copy, staging)| {
-                    if staging.take_upload() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::texture::note_read_at_submission(staging);
+                    let upload = staging.take_upload();
+                    #[cfg(feature = "diagnostics")]
+                    crate::texture::note_upload_decision(staging, upload);
+                    if upload {
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::TexUploads, 1);
                         Some((copy.clone(), staging.clone()))
