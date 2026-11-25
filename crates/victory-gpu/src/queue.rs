@@ -826,6 +826,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes `planes` plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        plane_shape_changes(frame, slice);
         let mut resources = Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
@@ -858,6 +859,32 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Logs a present whose planes differ from the one before: how many the
+/// title passed and, per plane, its resource count, its first resource and
+/// its token (the first 600 changes). To see whether the title presents a
+/// plane only on some frames (a strobe at the start screen: up to 24
+/// opposing jumps of brightness in a second, every one to two frames, while
+/// screens fade).
+#[cfg(windows)]
+fn plane_shape_changes(frame: u64, planes: &[Plane]) {
+    static LAST: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let shape: Vec<(u32, usize)> = planes
+        .iter()
+        .map(|p| {
+            // SAFETY: the plane lists `count` resources when it names any.
+            let first = if p.count == 0 || p.resources.is_null() { 0 } else { unsafe { *p.resources as usize } };
+            (p.count, first)
+        })
+        .collect();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != shape && LOGGED.fetch_add(1, Ordering::Relaxed) < 600 {
+        let tokens: Vec<u64> = planes.iter().map(|p| p.token).collect();
+        tracing::info!(frame, planes = planes.len(), shape = ?shape, ?tokens, "present planes changed");
+    }
+    *last = shape;
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
