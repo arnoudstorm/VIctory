@@ -375,6 +375,20 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
+/// At the present of a listed frame: saves what each presented plane's host
+/// copy holds (index 900 + plane), whether or not the frame rendered to it.
+pub(crate) fn dump_planes(frame: u64, planes: &[(crate::object::This, &ID3D12Resource, u32)]) {
+    if folder().is_none() || !listed(frame) {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    for (i, &(resource, texture, state)) in planes.iter().enumerate() {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        dump_one(host, texture, state, frame, 900 + i, resource, &d);
+    }
+}
+
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,

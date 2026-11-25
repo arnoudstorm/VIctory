@@ -840,6 +840,11 @@ extern "system" fn present(
                 resources.push((resource, texture, state));
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::capture::dump_planes(
+            frame,
+            &resources.iter().map(|&(r, t, s)| (r, t, s)).collect::<Vec<_>>(),
+        );
         if !resources.is_empty() {
             let sources: Vec<(&_, u32)> = resources
                 .iter()
