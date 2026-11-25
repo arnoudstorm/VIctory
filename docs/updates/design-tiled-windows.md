@@ -1,4 +1,6 @@
-# Design: windows that hold only the pages read (started 2026-11-25)
+# Tiled windows: windows that hold only the tiles copied (2026-11-25)
+
+**Status: built, opt-in (`VICTORY_TILED_WINDOWS=1`), on in `run-laptop.ps1`.**
 
 ## Why
 
@@ -48,3 +50,47 @@ probe 1 below.
 
 Up to the ~1.0-1.1 GB of window pages never copied, off both the card's
 budget and RAM; not yet measured in the game.
+
+## Built (`crate::tiles`, `Shadow::read_at` / `write_at` / `spans`)
+
+- Tiles go on pooled 4 MiB heaps (custom, write-back, L0), each covered by
+  one mapped placed buffer; a tile is zeroed when taken; a heap whose
+  tiles are all free is let go (one spare kept).
+- Every CPU access of a window goes through `read_at` (zeros where no
+  tile is mapped) or `write_at` (maps the tile first, on the host queue,
+  ahead of the next submission). Pieces of 64 KiB of title memory are
+  tiles, since windows start on that grid. Declared shader writes map
+  their whole range (`Shadow::writing`).
+- Tiles of a window let go are given back through `retire`: only after
+  every submission running then has finished.
+- Probe 4 (`probe_window_tiles_on_opened_heaps`): tiles on heaps opened on
+  our own memory remove the device on the 780M too (`0x887A0001`), so the
+  CPU side is per tile, not one range.
+
+Tests: `tiles::tests` (chunks; zeros until written; the card sees CPU
+writes) and `shadow::tiled_tests` (refresh maps only the tiles written;
+declared shader writes map and snapshot; copy-back reaches title memory;
+card and CPU side agree; unmapped tiles read 0 on the card). Workspace:
+527 passed, 0 failed.
+
+## Measured in the game (150 s, no keys, lazy lists on)
+
+| | Baseline (`p5-owners`) | Tiled, first build (`p5-tiled`) | Tiled, heaps let go (`p5-tiled2`) |
+|---|---|---|---|
+| Windows, full size | 2.3-2.7 GB | 2.4-2.7 GB | 2.3-2.7 GB |
+| Memory they hold | the same | heaps 2.13 GB (never shrank) | **1.86-1.99 GB** of tiles, heaps within 4 MB |
+| Mapped for shader writes | - | - | 0 MB |
+| The card at the world load | 6.3-7.3 GB | 6.6-7.2 GB | **6.0-7.0 GB** |
+| Errors, device removal | none | none | none |
+| Frame 600 | right | right (same planes, mean 81 vs 84) | - |
+
+- About **0.5-0.7 GB less** held by windows. Less than the ~1 GB never
+  copied: copies are by 4 KiB page, tiles are 64 KiB (Direct3D's
+  smallest), so a page copied takes its whole tile.
+- The card's peak drops ~0.3 GB, within run-to-run noise, and stays over
+  the 5.7-5.9 GB budget: tiled windows alone do not bring the world load
+  under it.
+- One warning kind was new in `p5-tiled2` (`buffer view the host would
+  refuse left null`, a raw view at bytes 8-72 of a 256 KiB window); the
+  check does not look at whether the buffer is tiled, and its unordered
+  sibling shows in untiled runs. Not tied to tiling; logged once.

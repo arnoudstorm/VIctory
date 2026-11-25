@@ -2942,6 +2942,96 @@ mod window_probe_tests {
             assert!(seen, "the copy through the reserved window did not see the CPU's write");
         }
     }
+
+    /// Probe 4: tiles of a reserved buffer mapped onto heaps opened on our
+    /// own memory (`OpenExistingHeapFromAddress1`, one 64 KiB heap per
+    /// committed page run of a reservation), so that the CPU side stays one
+    /// contiguous range. The module notes in `inplace.rs` say tile mappings
+    /// into opened heaps removed the device on the software adapter; this
+    /// asks the 780M.
+    #[test]
+    #[ignore = "probe: run alone; may remove the device"]
+    fn probe_window_tiles_on_opened_heaps() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = super::host() else { return };
+        const TILE: usize = 64 << 10;
+        const WINDOW: usize = 4 << 20;
+        // SAFETY: our own reservation; only committed pages are touched;
+        // plain object creation and a copy on our queue.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), WINDOW, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let c0 = card(host);
+            let device13 = host.device.cast::<ID3D12Device13>().expect("device 13");
+            let mut heaps = Vec::new();
+            for tile in [5usize, 11] {
+                let at = base.add(tile * TILE);
+                assert_eq!(VirtualAlloc(at.cast(), TILE, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                std::ptr::write_bytes(at, 0x40 + tile as u8, TILE);
+                let heap: ID3D12Heap = device13.OpenExistingHeapFromAddress1(at.cast(), TILE).expect("opened heap");
+                heaps.push((tile, heap));
+            }
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: WINDOW as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                ..Default::default()
+            };
+            let mut window: Option<ID3D12Resource> = None;
+            host.device
+                .CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut window)
+                .expect("reserved window");
+            let window = window.expect("reserved");
+            for (tile, heap) in &heaps {
+                let coord = D3D12_TILED_RESOURCE_COORDINATE { X: *tile as u32, Y: 0, Z: 0, Subresource: 0 };
+                let size = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), Width: 1, Height: 1, Depth: 1 };
+                let (flags, start, count) = (D3D12_TILE_RANGE_FLAG_NONE, 0u32, 1u32);
+                host.queue.UpdateTileMappings(
+                    &window, 1, Some(&coord), Some(&size), heap, 1, Some(&flags), Some(&start), Some(&count),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            let c1 = card(host);
+            // Measured 2026-11-25 on the 780M: the device is removed here
+            // (0x887A0001, invalid call), as on the software adapter. So a
+            // tiled window's CPU side can not be our own contiguous memory.
+            let after_mapping = host.device.GetDeviceRemovedReason();
+            eprintln!("device after mapping tiles onto opened heaps: {:?}", after_mapping.as_ref().err().map(|e| e.code()));
+            assert!(after_mapping.is_ok(), "mapping tiles onto heaps opened on our own memory removed the device");
+            // The card copies tiles 5, 11 and an unmapped tile 7 out.
+            let (out, out_at) = host.shared_buffer(3 * TILE as u64).expect("out");
+            std::ptr::write_bytes(out_at, 0xff, 3 * TILE);
+            let allocator: ID3D12CommandAllocator =
+                host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList =
+                host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).expect("list");
+            for (i, tile) in [5usize, 11, 7].into_iter().enumerate() {
+                list.CopyBufferRegion(&out, (i * TILE) as u64, &window, (tile * TILE) as u64, TILE as u64);
+            }
+            list.Close().expect("close");
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            host.queue.ExecuteCommandLists(&[Some(list.cast().expect("list"))]);
+            host.queue.Signal(&fence, 1).expect("signal");
+            fence.SetEventOnCompletion(1, HANDLE::default()).expect("wait");
+            let removed = host.device.GetDeviceRemovedReason();
+            let out = std::slice::from_raw_parts(out_at, 3 * TILE);
+            let (a, b, c) = (&out[..TILE], &out[TILE..2 * TILE], &out[2 * TILE..]);
+            eprintln!(
+                "tiles on heaps opened on our own memory: device {:?}; card +{} KiB for 2 tiles of a 4 MiB window; tile 5 right: {}, tile 11 right: {}, unmapped tile reads 0: {}",
+                removed.as_ref().err().map(|e| e.code()),
+                (c1 as i64 - c0 as i64) / 1024,
+                a.iter().all(|&x| x == 0x45),
+                b.iter().all(|&x| x == 0x4b),
+                c.iter().all(|&x| x == 0)
+            );
+            assert!(removed.is_ok());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7536,6 +7626,57 @@ impl Host {
                 .ok()?;
         }
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// Maps tile `tile` of the reserved buffer `buffer` onto tile
+    /// `heap_tile` of `heap`, on the host's queue: ahead of every
+    /// submission sent after it (`crate::tiles`).
+    pub(crate) fn map_tile(&self, buffer: &ID3D12Resource, tile: u32, heap: &ID3D12Heap, heap_tile: u32) {
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: tile, Y: 0, Z: 0, Subresource: 0 };
+        let size = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), Width: 1, Height: 1, Depth: 1 };
+        let (flags, count) = (D3D12_TILE_RANGE_FLAG_NONE, 1u32);
+        // SAFETY: a reserved buffer, a heap of ours, one tile each.
+        unsafe {
+            self.queue.UpdateTileMappings(
+                buffer,
+                1,
+                Some(&coord),
+                Some(&size),
+                heap,
+                1,
+                Some(&flags),
+                Some(&heap_tile),
+                Some(&count),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
+
+    /// Tests: `len` bytes of `buffer` from `offset`, copied out on the card
+    /// and waited for.
+    #[cfg(test)]
+    pub(crate) fn copy_out_for_test(&self, buffer: &ID3D12Resource, offset: u64, len: u64) -> Option<Vec<u8>> {
+        let (out, at) = self.shared_buffer(len)?;
+        // SAFETY: plain object creation; a copy on our queue, waited for.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+            let list: ID3D12GraphicsCommandList =
+                self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+            list.CopyBufferRegion(&out, 0, buffer, offset, len);
+            list.Close().ok()?;
+            let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            self.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
+            self.queue.Signal(&fence, 1).ok()?;
+            fence.SetEventOnCompletion(1, HANDLE::default()).ok()?;
+            Some(std::slice::from_raw_parts(at, len as usize).to_vec())
+        }
+    }
+
+    /// Tests: the device has not been removed.
+    #[cfg(test)]
+    pub(crate) fn device_alive(&self) -> bool {
+        // SAFETY: a plain query.
+        unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading

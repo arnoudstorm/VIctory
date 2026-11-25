@@ -77,6 +77,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `VICTORY_TILED_WINDOWS=1`, for a window: `buffer` is reserved,
+    /// and its tiles hold memory only once the CPU writes them; `data` is
+    /// null and the CPU side is found tile by tile ([`Shadow::read_at`],
+    /// [`Shadow::write_at`]).
+    tiles: Option<crate::tiles::Tiles>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1168,12 +1173,33 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
+                // A tiled window is passed as itself (low bit set): its
+                // pieces are found tile by tile (`piece_cpu`).
+                Some(before) => (
+                    if shadow.tiles.is_some() { Arc::as_ptr(shadow) as usize | 1 } else { shadow.data as usize },
+                    before.as_ptr() as usize,
+                    shadow.start as usize,
+                    from,
+                    to,
+                ),
                 None => (0, 0, 0, 0, 0),
             }
         })
         .collect();
     find_pieces(scans)
+}
+
+/// Where a piece at offset `at` of a scan's copy is: `data` is the copy's
+/// CPU side, or (low bit set) a tiled window itself, kept alive by the
+/// caller. A piece lies in one tile (pieces are cut at 64 KiB of title
+/// memory, and tiled windows start on that grid).
+fn piece_cpu(data: usize, at: usize) -> *const u8 {
+    if data & 1 == 1 {
+        // SAFETY: `find_all` passes a shadow its caller holds.
+        unsafe { &*((data & !1) as *const Shadow) }.read_at(at)
+    } else {
+        (data + at) as *const u8
+    }
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1211,7 +1237,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // are compared.
                     let (now, old) = unsafe {
                         (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
+                            std::slice::from_raw_parts(piece_cpu(data, at), n),
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
@@ -1781,6 +1807,40 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            tiles: None,
+        }
+    }
+
+    /// The CPU side at offset `off`, for reading: valid to the end of its
+    /// tile (tiled windows: zeros where no tile is mapped), else of the copy.
+    fn read_at(&self, off: usize) -> *const u8 {
+        match &self.tiles {
+            Some(t) => t.read_at(off),
+            // SAFETY: inside the mapping (callers pass offsets in the copy).
+            None => unsafe { self.data.add(off) },
+        }
+    }
+
+    /// The CPU side at offset `off`, for writing: valid to the end of its
+    /// tile (mapped first if it was not), else of the copy. Null if a tiled
+    /// window's tile could not be had.
+    fn write_at(&self, off: usize) -> *mut u8 {
+        match &self.tiles {
+            Some(t) => t.write_at(&self.buffer, off),
+            // SAFETY: as in `read_at`.
+            None => unsafe { self.data.add(off) },
+        }
+    }
+
+    /// Offsets `[from, to)` as pieces that each lie in one tile (one piece
+    /// if the copy is not tiled).
+    fn spans(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if from >= to {
+            return Vec::new();
+        }
+        match &self.tiles {
+            Some(_) => crate::tiles::chunks(from, to).collect(),
+            None => vec![(from, to - from)],
         }
     }
 
@@ -1824,6 +1884,11 @@ impl Shadow {
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
+        }
+        // Shaders write there: a tile not mapped would drop their writes.
+        if let Some(tiles) = &self.tiles {
+            let (from, to) = self.inside(address, len);
+            tiles.map_range(&self.buffer, from, to);
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -1894,7 +1959,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        std::ptr::copy_nonoverlapping(self.read_at(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -1908,16 +1973,22 @@ impl Shadow {
             // then. The snapshot's memory stays where it is until the
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
-            snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
+            let snapshot = snapshot.as_mut_ptr() as usize;
+            for (from, to) in parts {
+                for (at, n) in self.spans(from, to) {
+                    snaps.push((self.read_at(at) as usize, snapshot + at, n));
+                }
+            }
             return;
         }
         for (from, to) in parts {
             if from < to {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
-                unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                for (at, n) in self.spans(from, to) {
+                    unsafe {
+                        copy_wide(self.read_at(at), snapshot.as_mut_ptr().add(at), n);
+                    }
                 }
             }
         }
@@ -1979,7 +2050,11 @@ impl Shadow {
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let host = self.write_at(at);
+                if host.is_null() {
+                    continue;
+                }
+                let host = unsafe { std::slice::from_raw_parts_mut(host, n) };
                 let old = &before[at - from..at - from + n];
                 // From the first byte that differs to the last: title
                 // memory is read and written there only (a shader that sets
@@ -2075,7 +2150,7 @@ impl Shadow {
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(self.read_at(at), now.as_mut_ptr(), n);
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -2109,7 +2184,7 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
+        let start = self.start as usize;
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
@@ -2117,7 +2192,7 @@ impl Shadow {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+                let host = unsafe { std::slice::from_raw_parts(self.read_at(at), n) };
                 if host != &before[at - from..at - from + n] {
                     found.push((at, n));
                 }
@@ -2376,7 +2451,10 @@ impl Shadow {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                        let to = self.write_at(at + r);
+                        if !to.is_null() {
+                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), to, m) };
+                        }
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
@@ -2506,9 +2584,15 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // Inside the mapping (`from` and `to` are within the buffer); a
+        // tiled window tile by tile, each mapped as it is first written.
+        for (at, n) in self.spans(from - start, to - start) {
+            let dst = self.write_at(at);
+            if dst.is_null() {
+                continue;
+            }
+            crate::host::copy_mapped(dst, (start + at) as *const u8, n, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -3065,6 +3149,22 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // Tiled (`crate::tiles`): a reserved buffer, memory only for the tiles
+    // written. Windows start and end on the 64 KiB grid.
+    let tile = crate::tiles::TILE as u64;
+    if crate::tiles::on() && start % tile == 0 && len % tile == 0 {
+        let buffer = crate::tiles::reserved(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} tiled"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
+        shadow.window = true;
+        shadow.tiles = Some(crate::tiles::Tiles::new(len as usize));
+        let shadow = Arc::new(shadow);
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -3238,4 +3338,77 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Tiled windows (`crate::tiles`) through the write paths windows use: a
+/// refresh copies title memory in tile by tile, mapping only the tiles it
+/// writes; declared shader writes map their range and are snapshotted;
+/// what "the card" wrote there is copied back into title memory; and the
+/// card reads the same bytes through the reserved buffer.
+#[cfg(test)]
+mod tiled_tests {
+    use super::*;
+    use crate::tiles::TILE;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    #[test]
+    fn tiled_window_refresh_shader_writes_and_copy_back() {
+        let Some(host) = host() else { return };
+        const LEN: usize = 16 * TILE;
+        // Title memory of our own, on the 64 KiB grid.
+        // SAFETY: a fresh allocation of LEN bytes, freed at the end.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null() && title as usize % TILE == 0);
+        // SAFETY: inside the allocation.
+        let title_bytes = unsafe { std::slice::from_raw_parts_mut(title, LEN) };
+        for (i, b) in title_bytes.iter_mut().enumerate() {
+            *b = (i / 4096) as u8 ^ 0x33;
+        }
+        let start = title as u64;
+        let buffer = crate::tiles::reserved(LEN as u64).expect("reserved");
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, LEN as u64);
+        shadow.window = true;
+        shadow.tiles = Some(crate::tiles::Tiles::new(LEN));
+        let tiles = |s: &Shadow| s.tiles.as_ref().map_or(0, |t| t.mapped());
+
+        // A refresh of tiles 2-4 (cut mid-tile): three tiles mapped, bytes in.
+        let (a, b) = (2 * TILE + 100, 4 * TILE + 200);
+        assert_eq!(shadow.update(start as usize + a, b - a), b - a);
+        assert_eq!(tiles(&shadow), 3);
+        for off in [a, a + 1, 3 * TILE, b - 1] {
+            // SAFETY: read_at is valid to its tile's end.
+            assert_eq!(unsafe { *shadow.read_at(off) }, title_bytes[off], "refreshed byte at {off:#x}");
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { *shadow.read_at(10 * TILE) }, 0, "a tile never written reads 0");
+
+        // Shaders write tiles 8-9: mapped and snapshotted at declaration.
+        let (w0, w1) = (8 * TILE, 10 * TILE);
+        shadow.writing(start as usize + w0, w1 - w0);
+        assert_eq!(tiles(&shadow), 5);
+        // "The card" writes 32 bytes in tile 9 (through the CPU side, as
+        // the card's writes land in the same heap memory).
+        let at = 9 * TILE + 4000;
+        // SAFETY: a mapped tile, 32 bytes inside it.
+        unsafe { std::ptr::write_bytes(shadow.write_at(at), 0xee, 32) };
+        let written = shadow.copy_back(start as usize + w0, w1 - w0);
+        assert_eq!(written, 32);
+        assert!(title_bytes[at..at + 32].iter().all(|&x| x == 0xee), "the card's bytes reached title memory");
+        assert_ne!(title_bytes[at + 32], 0xee);
+        shadow.copy_back_done(&[(start as usize + w0, start as usize + w1)]);
+
+        // The card reads what the CPU side holds.
+        let out = host.copy_out_for_test(&shadow.buffer, 0, LEN as u64).expect("read back");
+        for off in [a, 3 * TILE + 17, b - 1, at, at + 31] {
+            // SAFETY: as above.
+            assert_eq!(out[off], unsafe { *shadow.read_at(off) }, "card and CPU side agree at {off:#x}");
+        }
+        assert!(out[10 * TILE..11 * TILE].iter().all(|&x| x == 0), "an unmapped tile reads 0 on the card");
+        assert!(host.device_alive());
+        drop(shadow);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
 }
