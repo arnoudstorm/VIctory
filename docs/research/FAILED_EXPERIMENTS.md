@@ -98,3 +98,28 @@ quality, not correctness of the rest of the frame.
   input (needs the builder's input layout written down first: spilled
   user-data table, root views, node format in `bvh.rs`), or first
   lowering memory enough that a builder run is not starved.
+
+## E17 (2026-11-25): merging overlapping windows (`VICTORY_MERGE_WINDOWS`), reverted
+
+- Change: a window that would overlap others in its 4 MiB cell covers
+  them all and takes over their keys. Descriptor slots made before a
+  merge are made again on the merged window the first time they are
+  read after it. Second try: the heap pass also drops cached ranges
+  whose copy was merged away. Test `overlapping_windows_of_a_cell_merge`.
+- Run `merge-windows` (first try), against `window-shapes`:
+  duplicates gone (windows 1,673 MB over 1,664 MB of title memory,
+  before 2,031 over 1,368), **GPU memory 7,189 -> 6,302 MB (-887 MB)**,
+  private memory 12.6 -> 11.6 GB, 20,469 keys taken over, 29,493 slots
+  made again. But moves doubled (90 -> 200 ms per frame), and the
+  **device was removed** (hung, `0x887A0006`) about 100 s into the world.
+- Run `merge-windows-2` (with the heap-pass fix): GPU memory 5,332 MB,
+  but the **device was removed** at 134 s during the load, after 11,565
+  merges, with moves at 1.4 s per frame.
+- Cause not pinned down. Candidates: copies cached outside the window
+  table (a root view's copy is kept with its slot in `draw.rs`, the
+  relay's in-flight ranges by copy), tiled windows read where the new
+  window has no tiles mapped yet, and the cost of re-copying on every
+  merge during streaming. Reverted: two runs, two device removals.
+- What it shows: about 0.9 GB of GPU memory is duplicate window copies.
+  A safe version needs every place that holds a window to go through
+  one lookup, and merging only between frames, not on every ask.

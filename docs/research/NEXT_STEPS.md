@@ -1,5 +1,11 @@
 # Next steps
 
+Memory (2026-11-25): the duplicate windows are worth ~0.9 GB of GPU
+memory (E17), but merging them on every ask removed the device twice.
+Next try: list every place that keeps a window (`shadow::find` callers,
+root-view caches in `draw.rs`, the relay) and merge once per frame, at
+the sweep, not inside `loose`.
+
 Status 2026-11-25 (E9-E13): in-place memory gives little; input lag is
 the frame time; the ray-traced lighting (builder) crashes the title,
 hangs the GPU, or runs out of memory first on this 16 GB laptop.
