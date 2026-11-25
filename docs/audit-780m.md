@@ -162,6 +162,30 @@ copy-back, joined copies, 256 KiB windows with tails, `VICTORY_INPLACE=1`,
 `VICTORY_CARD_BUFFERS_MB=256`, `VICTORY_SHADER_LOOP_LIMIT=64`,
 `VICTORY_F16_NEAREST=1`, `VICTORY_NO_WATCHDOG=1`.
 
+### Run with these settings (2026-11-25, `e9afbad`, diagnostics build)
+
+Report: `run-reports` branch, `run-2026-11-25-0311`.
+
+| | Before (relay run, `f53e10e`) | With the settings and `c96b4f2` |
+|---|---|---|
+| World reached | ~3 min after start | ~2 min |
+| Pipelines at the world | 1,537 cached, 340 built | 1,877 cached, 13 built |
+| Frame in the world | 1.2-3.0 s | 0.5 s at 457 draws, 1.5 s at 3,024 draws |
+| Card at the end | 7.4-7.8 GB of 5.9-6.0 GB | 7.8 GB of 6.2 GB |
+| Copies of title memory | 3.0 GB (2.4 GB windows) | 3.0 GB (2.4 GB windows) |
+| Textures the title fills | 0.4 GB | 0.8 GB (1,217 alive) |
+| End | out of memory, device removed | the same, ~1 min into the world |
+
+- `VICTORY_TEXTURE_ROOM_PERCENT=75` **had no effect**: "passes that made
+  none for lack of room: 0". `resource::room` lets texture copies reach a
+  2 GB floor before it looks at the card's budget, and they stayed at
+  0.8 GB. A budget-relative floor would make the share apply; it would
+  also hold back textures while the copies of title memory (3 GB) are
+  what overflows, so it is not a fix for the device removal.
+- The first allocation refused was a texture (E_OUTOFMEMORY).
+- Faster to the world: the pipeline library held almost every pipeline,
+  and textures were uploaded while loading (`c96b4f2`).
+
 ## Unresolved
 
 - Runs end about a minute into the world on the card's budget; the copies
