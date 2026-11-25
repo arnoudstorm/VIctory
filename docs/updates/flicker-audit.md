@@ -1,7 +1,24 @@
 # Flicker at the start screen (photosensitivity)
 
-**Status: measured, cause not yet found, not fixed.** Do not watch the
-start screen's transitions until it is.
+**Status: cause found, not yet fixed.** Do not watch the start screen's
+transitions until it is.
+
+## Cause (traced 2026-11-25, `434a164`)
+
+- The start screen is a video. The title decodes it on the CPU into a
+  **ring of three** YUV texture sets (3840x2160 luma, two 1920x1080 chroma),
+  and pixel shader `3bfe73…` turns slot N mod 3 into the UI plane each frame.
+- Plane dumps and per-frame levels: every jump repeats the frame **3 frames
+  before** (57 of 71 jumps), i.e. a slot shows the image from its previous
+  ring cycle. VIctory uploads the slot each frame, but at submission, before
+  the CPU decoder has written the new frame into it; on the console the GPU
+  runs a frame or two behind and reads it after the decode.
+- `8d2591e` (Adrito's `737fcb7`: changed textures upload in the same
+  submission) fixes a real upload lag and its 2 GPU tests pass, but the
+  recapture is unchanged: up to 29 flashes in one second.
+- What would fix it: read such textures later (run a frame's GPU work at
+  its present, as the console's latency does), or a presentation guard
+  that caps reversals at 3 a second as a stopgap.
 
 ## What was measured
 
