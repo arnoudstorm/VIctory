@@ -31,3 +31,28 @@ quality, not correctness of the rest of the frame.
   359 ms; 226 and 261 samples). A frame-time change has to beat about
   15 % to count from one run each. Neither run had a black frame after
   the cut or a device removal, and free RAM fell to 7 MB in both.
+
+## E9 (2026-11-25): in-place runs (`VICTORY_INPLACE_RUNS=1`), run `inplace-runs`: not worth building on
+
+- Hypothesis (E8): routing asks to in-place runs removes most of the 84
+  ms of moves per frame.
+- Census of the windows asked for over the run (`inplace.rs`):
+
+| How the memory lies | Asks | MB | Can be in place |
+|---|---|---|---|
+| one run of one section | 1,865 | 636 | yes |
+| scattered over the page pool | 3,551 | 1,416 | no |
+| partly outside the runtime's views | 3,939 | 4,554 | no |
+
+  The page pool is mapped 64 KiB at a time (85,500 views alive, 9.5 GB),
+  so a window over it is never one range of anything the card can open.
+  At most about a tenth of the asked memory could be in place. 317 MB
+  was in place at the end; 1,206 windows were let go because the title
+  remapped their pages.
+- Measured against `staging-fix`: 696 vs 732 ms per frame (inside the
+  15 % spread), but moves went **up** (84 -> 115 ms), and free RAM fell
+  to 2 MB. Off, as in `run-laptop.ps1`.
+- Conclusion: copying title memory is structural, because the console's
+  page mapping has no host equivalent. Cutting it needs the copies to be
+  skipped where nothing changed (the write watch already does this), not
+  in-place memory.
