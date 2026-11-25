@@ -2,6 +2,7 @@
 
 Written by run_report.py while the game runs. Newest first.
 
+- [run-2026-11-25-1638](run-2026-11-25-1638.md): No failure seen yet.
 - [run-2026-11-25-1625](run-2026-11-25-1625.md): No failure seen yet.
 - [run-2026-11-25-1619](run-2026-11-25-1619.md): No failure seen yet.
 - [run-2026-11-25-1615](run-2026-11-25-1615.md): No failure seen yet.
