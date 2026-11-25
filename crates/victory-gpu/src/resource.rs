@@ -1366,26 +1366,80 @@ pub(crate) fn host_made<'a>(
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
+///
+/// None while the card is at or past its budget, whatever the floor or the
+/// limit: on a card that shares the PC's memory (Radeon 780M, a ~6 GB
+/// budget) these optional copies kept being made up to the floor while the
+/// card stood at 7.7 GB of 6.2, and the next allocation the title needed
+/// failed. The slots wait, as they do without room (nothing is faked).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
     let filled = KINDS[1].load(Relaxed);
+    let card = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map(|[budget, used, ..]| (budget, used));
+    room_for(filled, limit, card, room_percent())
+}
+
+/// [`room`]'s decision: `filled` bytes of such copies, the byte `limit`
+/// if one is set, the card's `(budget, used)` if the system says, and the
+/// share of the budget in percent.
+fn room_for(filled: u64, limit: Option<u64>, card: Option<(u64, u64)>, percent: u64) -> bool {
+    const FLOOR: u64 = 2 << 30;
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    if let Some((budget, used)) = card
+        && budget > 0
+        && used >= budget
+    {
+        return false;
+    }
     if let Some(limit) = limit {
         return filled < limit;
     }
     if filled < FLOOR {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+    match card {
+        Some((budget, used)) => used < budget / 100 * percent,
         None => filled < WITHOUT_BUDGET,
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::room_for;
+
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn a_card_past_its_budget_has_no_room() {
+        // The 780M run: 0.8 GB of copies, the card at 7.7 GB of 6.2.
+        assert!(!room_for(GB * 8 / 10, None, Some((GB * 62 / 10, GB * 77 / 10)), 90));
+        // A byte limit does not override it either.
+        assert!(!room_for(GB / 2, Some(GB), Some((6 * GB, 6 * GB)), 90));
+    }
+
+    #[test]
+    fn under_the_budget_nothing_changes() {
+        // Under the floor: room, whatever the share.
+        assert!(room_for(GB, None, Some((10 * GB, 9 * GB)), 50));
+        // Past the floor: the share of the budget decides.
+        assert!(room_for(3 * GB, None, Some((10 * GB, 8 * GB)), 90));
+        assert!(!room_for(3 * GB, None, Some((10 * GB, 9 * GB + GB / 2)), 90));
+        // A byte limit, under the budget.
+        assert!(room_for(GB / 2, Some(GB), Some((10 * GB, 5 * GB)), 90));
+        assert!(!room_for(GB, Some(GB), Some((10 * GB, 5 * GB)), 90));
+        // No budget reported: the fixed cap.
+        assert!(room_for(3 * GB, None, None, 90));
+        assert!(!room_for(4 * GB, None, None, 90));
+        // A budget of 0 (not reported properly) is not "past the budget".
+        assert!(room_for(GB, None, Some((0, 0)), 90));
     }
 }
 

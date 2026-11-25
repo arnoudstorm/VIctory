@@ -186,6 +186,19 @@ Report: `run-reports` branch, `run-2026-11-25-0311`.
 - Faster to the world: the pipeline library held almost every pipeline,
   and textures were uploaded while loading (`c96b4f2`).
 
+### 64 KiB windows, 96 lists in the air (`run-2026-11-25-0316`)
+
+| | 256 KiB, 256 lists | 64 KiB, 96 lists |
+|---|---|---|
+| World reached | ~2 min | ~1.5 min |
+| Windows at the end | 5,086 alive, 2,392 MB | 11,150 alive, 2,171 MB |
+| All copies of title memory | 8,312 alive, 2,982 MB | 14,163 alive, 2,784 MB |
+| Card at the end | 7.8 GB of 6.2 GB | 7.7 GB of 6.2 GB |
+| End | out of memory ~1 min into the world | the same |
+
+The finest grid saves ~0.2 GB for twice the copies: the grid is spent as
+a lever.
+
 ## Unresolved
 
 - Runs end about a minute into the world on the card's budget; the copies
