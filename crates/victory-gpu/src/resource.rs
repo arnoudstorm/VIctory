@@ -314,6 +314,11 @@ pub(crate) fn stands_in(this: This) -> bool {
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Host textures the host refused to make (out of memory, an unsupported
+/// description), since the start: each is a texture the title draws with
+/// and the host does not have, shown in the window caption.
+pub(crate) static TEXTURE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether the title asked for both depth and unordered access for `this`.
 #[cfg(windows)]
 pub(crate) fn depth_and_unordered(this: This) -> bool {
@@ -1692,6 +1697,7 @@ fn host_texture(
         )
     };
     if let Err(e) = made {
+        TEXTURE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {

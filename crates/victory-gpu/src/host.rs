@@ -2698,6 +2698,46 @@ fn late_line(frames: f64) {
 }
 
 #[cfg(test)]
+mod telemetry_tests {
+    use super::Telemetry;
+
+    #[test]
+    fn the_caption_shows_every_field() {
+        let t = Telemetry {
+            fps: 0.8,
+            ms: 1194.7,
+            cpu_ms: 616.9,
+            wait_ms: 398.9,
+            draws: 3351.0,
+            ram_mb: 6735,
+            vram: Some([6957, 6001, 120]),
+            shared_buffers: 1143,
+            upload_buffers: 42,
+            texture_failures: 7,
+            pipelines_loaded: 900,
+            pipelines_made: 1200,
+        };
+        assert_eq!(
+            t.caption(),
+            " | VIctory 0.8 fps 1194.7 ms (CPU 616.9, GPU wait 398.9) 3351 draws | RAM 6735 MB | \
+             VRAM 6957/6001 MB, shared 120 MB | buffers 1143 shared, 42 upload | texture failures 7 | \
+             pipelines 900 cached, 1200 built"
+        );
+    }
+
+    #[test]
+    fn an_unreported_card_says_so() {
+        let t = Telemetry { vram: None, ..Default::default() };
+        assert!(t.caption().contains("VRAM n/a"));
+    }
+
+    #[test]
+    fn the_process_reports_its_memory() {
+        assert!(super::process_private_bytes() > 0);
+    }
+}
+
+#[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
 
@@ -6305,7 +6345,10 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let telemetry = Telemetry::now(fps, ms, cpu, gpu, draws);
+        let text = telemetry.caption();
+        // The same numbers in the log once a second, for run reports.
+        tracing::info!(target: "victory_gpu::overlay", "overlay:{text}");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -6331,6 +6374,92 @@ impl Meter {
                 });
         });
     }
+}
+
+/// What the window caption shows once a second (the diagnostics overlay):
+/// frame rate and times, the CPU's and the GPU's share, the process's
+/// memory, the card's, allocations, texture failures and the pipeline
+/// cache. All of it is counted elsewhere already; this only gathers it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Telemetry {
+    fps: f64,
+    /// Milliseconds per frame, of them preparing submissions on the CPU,
+    /// and waiting for the GPU (the synchronisation cost).
+    ms: f64,
+    cpu_ms: f64,
+    wait_ms: f64,
+    draws: f64,
+    /// The process's private memory, in MiB.
+    ram_mb: u64,
+    /// The card's memory this process uses and its budget, then the PC's
+    /// memory shared with the card in use, in MiB (`None`: not reported).
+    vram: Option<[u64; 3]>,
+    /// Host buffers made since the start: shared with the CPU, upload.
+    shared_buffers: u64,
+    upload_buffers: u64,
+    /// Host textures the host refused to make since the start.
+    texture_failures: u64,
+    /// Pipelines loaded from the library and made by the driver.
+    pipelines_loaded: u64,
+    pipelines_made: u64,
+}
+
+impl Telemetry {
+    /// The counters as they are now, with the frame numbers given.
+    fn now(fps: f64, ms: f64, cpu_ms: f64, wait_ms: f64, draws: f64) -> Telemetry {
+        let vram = host().and_then(Host::video_memory).map(|[budget, own, _, shared]| [own >> 20, budget >> 20, shared >> 20]);
+        Telemetry {
+            fps,
+            ms,
+            cpu_ms,
+            wait_ms,
+            draws,
+            ram_mb: process_private_bytes() >> 20,
+            vram,
+            shared_buffers: MADE[2].load(Ordering::Relaxed),
+            upload_buffers: MADE[0].load(Ordering::Relaxed),
+            texture_failures: crate::resource::TEXTURE_FAILURES.load(Ordering::Relaxed),
+            pipelines_loaded: crate::pipeline::library::LOADED.load(Ordering::Relaxed),
+            pipelines_made: crate::pipeline::library::MADE.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The caption's text, appended to the title's own window text.
+    fn caption(&self) -> String {
+        let vram = match self.vram {
+            Some([own, budget, shared]) => format!("VRAM {own}/{budget} MB, shared {shared} MB"),
+            None => "VRAM n/a".to_owned(),
+        };
+        format!(
+            " | VIctory {:.1} fps {:.1} ms (CPU {:.1}, GPU wait {:.1}) {:.0} draws | RAM {} MB | {vram} | \
+             buffers {} shared, {} upload | texture failures {} | pipelines {} cached, {} built",
+            self.fps,
+            self.ms,
+            self.cpu_ms,
+            self.wait_ms,
+            self.draws,
+            self.ram_mb,
+            self.shared_buffers,
+            self.upload_buffers,
+            self.texture_failures,
+            self.pipelines_loaded,
+            self.pipelines_made
+        )
+    }
+}
+
+/// The process's private (committed) bytes; 0 if Windows does not say.
+fn process_private_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and its size describe a writable PROCESS_MEMORY_COUNTERS_EX
+    // (the call takes the base layout's pointer).
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), counters.cb) } != 0;
+    if ok { counters.PrivateUsage as u64 } else { 0 }
 }
 
 impl Host {
