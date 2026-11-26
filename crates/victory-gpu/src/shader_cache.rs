@@ -33,6 +33,58 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// Offline (`victory prewarm-shaders`): fills the shader cache in `dir`
+/// with the translations of `containers`, under the key a run on this
+/// PC would use. The card's widest wave and its view heap limit are asked
+/// of a device on the default adapter, as the runtime's host asks them;
+/// the translation switches (`VICTORY_SHADER_LOOP_LIMIT`,
+/// `VICTORY_F16_NEAREST`, ...) come from the environment, as at run time,
+/// so the tool must run with the launcher's values. `jobs` workers.
+/// Returns (found in the cache, translated now, failed).
+#[cfg(windows)]
+pub fn prewarm(dir: PathBuf, containers: &[Vec<u8>], jobs: usize) -> windows::core::Result<(u64, u64, u64)> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: plain device creation and a feature query into a local.
+    unsafe {
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
+            .is_ok()
+        {
+            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+        }
+        let views = crate::descriptor::host::view_limit_on(&device);
+        victory_shader::emit::set_view_heap_limit(views - 1);
+        tracing::info!(waves = o1.WaveLaneCountMax, views, "shader cache fill: keyed as for this card");
+    }
+    use_shader_cache(dir);
+    let Some(cache) = CACHE.get() else {
+        return Err(windows::core::Error::empty());
+    };
+    let key = build();
+    let failed = AtomicU64::new(0);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (hits, misses) = counts();
+    std::thread::scope(|s| {
+        for _ in 0..jobs.max(1) {
+            s.spawn(|| {
+                while let Some(c) = containers.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+                    if cached(cache, key, c, translate).is_err() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let (h, m) = counts();
+    Ok((h - hits, m - misses, failed.into_inner()))
+}
+
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))

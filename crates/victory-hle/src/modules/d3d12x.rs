@@ -49,6 +49,14 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Offline: fills the shader cache folder `dir` with translations of
+/// `containers` as a run on this PC keys them (see
+/// `victory_gpu::shader_cache::prewarm`): (found, translated, failed).
+#[cfg(windows)]
+pub fn prewarm_shaders(dir: std::path::PathBuf, containers: &[Vec<u8>], jobs: usize) -> Result<(u64, u64, u64), String> {
+    victory_gpu::shader_cache::prewarm(dir, containers, jobs).map_err(|e| e.to_string())
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

@@ -314,6 +314,48 @@ pub fn run(
     Ok(())
 }
 
+/// `victory prewarm-shaders`: the containers under `paths` (or only those
+/// whose log hash `only` lists) translated into the configured run cache.
+pub fn prewarm(paths: Vec<PathBuf>, only: Option<PathBuf>, jobs: usize) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let only: Option<HashSet<String>> = match only {
+        Some(f) => Some(
+            std::fs::read_to_string(&f)?
+                .lines()
+                .map(|l| l.trim().to_ascii_lowercase())
+                .filter(|l| l.len() == 16)
+                .collect(),
+        ),
+        None => None,
+    };
+    let mut containers = Vec::new();
+    let mut seen = HashSet::new();
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else { continue };
+            for source in sources(&data) {
+                let Some(bytes) = source.bytes() else { continue };
+                let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                if only.as_ref().is_some_and(|o| !o.contains(&hash)) || !seen.insert(hash) {
+                    continue;
+                }
+                containers.push(bytes.into_owned());
+            }
+        }
+    }
+    let wanted = only.as_ref().map_or(0, HashSet::len);
+    println!("prewarm      {} containers found ({} hashes listed)", containers.len(), wanted);
+    let cfg = victory_core::Config::load()?;
+    let dir = cfg.cache_subdir("shaders")?;
+    let (hits, translated, failed) =
+        victory_hle::modules::d3d12x::prewarm_shaders(dir, &containers, jobs).map_err(anyhow::Error::msg)?;
+    println!("prewarm      {hits} already cached, {translated} translated now, {failed} failed");
+    Ok(())
+}
+
 fn translate(
     source: &Source,
     path: &Path,

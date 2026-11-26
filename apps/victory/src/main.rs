@@ -85,6 +85,20 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate shaders into the run cache ahead of a run, keyed as a run
+    /// on this PC would key them (its card's wave width and view heap; the
+    /// translation switches from the environment, so set the launcher's).
+    /// Only containers whose log hash is listed in `--only` (one 16-hex
+    /// hash per line, as runs log them), if given.
+    PrewarmShaders {
+        paths: Vec<PathBuf>,
+        /// File of shader hashes to fill (others are skipped).
+        #[arg(long)]
+        only: Option<PathBuf>,
+        /// Worker threads (default 4).
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -163,6 +177,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::PrewarmShaders { paths, only, jobs } => translate::prewarm(paths, only, jobs),
         Command::Run {
             exe,
             unimplemented,
