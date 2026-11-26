@@ -1697,7 +1697,10 @@ impl State {
                     continue;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-                if n < 200 || n.is_multiple_of(1000) {
+                // A streamed scene can change thousands of slots together.
+                // Keep enough samples to diagnose it without making a
+                // diagnostics build spend whole frames formatting warnings.
+                if n < 16 || (n + 1).is_power_of_two() {
                     tracing::warn!(
                         slot = index,
                         address = format_args!("{at:#x}"),
