@@ -1159,6 +1159,19 @@ impl HostHeap {
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             let given = slots.iter().filter(|taken| **taken).count() as u32;
+            #[cfg(feature = "diagnostics")]
+            if given != 0 {
+                let first = at as usize + self.count as usize;
+                let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                let held = slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, taken)| **taken)
+                    .filter(|(offset, _)| kept.get(first + offset).is_some_and(Option::is_some))
+                    .count() as u64;
+                crate::copystat::add(crate::copystat::C::DynamicReleased, u64::from(given));
+                crate::copystat::add(crate::copystat::C::DynamicRetained, held);
+            }
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
