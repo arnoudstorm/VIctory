@@ -444,6 +444,32 @@ mod alias_tests {
         v.count(c, true);
         assert!(!v.aliased(0x10_0000 + k, 16));
     }
+
+    #[test]
+    fn other_views_of_the_same_bytes_are_found_byte_for_byte() {
+        let k = K64;
+        let mut v = views();
+        // Section 7: A shows offsets 0..3k at 0x100000, B shows k..2k at
+        // 0x900000, C shows 2k+256..2k+512 at 0xA00000; section 8 at 0xB00000.
+        for (at, view) in [
+            (0x10_0000usize, (3 * k, 7usize, 0u64)),
+            (0x90_0000, (k, 7, k as u64)),
+            (0xA0_0000, (256, 7, 2 * k as u64 + 256)),
+            (0xB0_0000, (3 * k, 8, 0)),
+        ] {
+            v.views.insert(at, view);
+            v.count(view, true);
+        }
+        // A's page 1, bytes 16..48: B's bytes 16..48.
+        assert_eq!(v.others(0x10_0000 + k + 16, 32), vec![(0x90_0010, 0x90_0030)]);
+        // All of A: B whole and C whole; not A itself nor section 8.
+        assert_eq!(v.others(0x10_0000, 3 * k), vec![(0x90_0000, 0x90_0000 + k), (0xA0_0000, 0xA0_0100)]);
+        // Page 2 of A outside C's 256 bytes: same 64 KiB page, no shared byte.
+        assert!(v.aliased(0x10_0000 + 2 * k, 16));
+        assert_eq!(v.others(0x10_0000 + 2 * k, 16), vec![]);
+        // Through B: A's bytes.
+        assert_eq!(v.others(0x90_0000, k), vec![(0x10_0000 + k, 0x10_0000 + 2 * k)]);
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +577,41 @@ impl Views {
 
     /// Whether any page of `[at, at + len)` that the views show is shown
     /// by another view too.
+    /// The address ranges of other views that show the same section bytes
+    /// as `[at, at + len)` (byte for byte, not by 64 KiB page), in address
+    /// order: where the title can write this memory with no guard on it.
+    fn others(&self, at: usize, len: usize) -> Vec<(usize, usize)> {
+        let end = at.saturating_add(len.max(1));
+        let first = self.views.range(..=at).next_back().filter(|(base, v)| *base + v.0 > at);
+        let shown: Vec<(usize, u64, u64)> = first
+            .into_iter()
+            .chain(self.views.range(at.saturating_add(1)..end))
+            .map(|(&base, &(bytes, section, offset))| {
+                let from = at.max(base) - base;
+                let to = end.min(base + bytes) - base;
+                (section, offset + from as u64, offset + to as u64)
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (&base, &(bytes, section, offset)) in &self.views {
+            for &(s, a, b) in &shown {
+                let (lo, hi) = (a.max(offset), b.min(offset + bytes as u64));
+                if s != section || lo >= hi {
+                    continue;
+                }
+                let (va, vb) = (base + (lo - offset) as usize, base + (hi - offset) as usize);
+                // The range's own view (views do not overlap in address).
+                if va >= at && vb <= end {
+                    continue;
+                }
+                out.push((va, vb));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     fn aliased(&self, at: usize, len: usize) -> bool {
         let end = at.saturating_add(len.max(1));
         let first = self.views.range(..=at).next_back().filter(|(base, v)| *base + v.0 > at).map(|(b, v)| (*b, *v));
@@ -574,6 +635,12 @@ impl Views {
 pub(crate) fn aliased(at: usize, len: usize) -> bool {
     let v = views();
     !v.pages.is_empty() && v.aliased(at, len)
+}
+
+/// The other views' address ranges that show the bytes of
+/// `[at, at + len)` ([`aliased`] memory's other ways in).
+pub(crate) fn alias_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    views().others(at, len)
 }
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
@@ -1572,6 +1639,39 @@ mod tests {
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+    /// `VICTORY_ALIAS_GUARD`'s premise: the other view of an aliased
+    /// texture's bytes is found, can be guarded, and a write through it
+    /// shows as a newer asking for its pages.
+    #[test]
+    fn a_write_through_another_view_of_the_same_bytes_is_seen_by_its_guard() {
+        let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        // SAFETY: a section and two views of the test's own.
+        unsafe {
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, (2 * K64) as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            let a = mem::MapViewOfFile(handle, mem::FILE_MAP_ALL_ACCESS, 0, 0, 2 * K64).Value as usize;
+            let b = mem::MapViewOfFile(handle, mem::FILE_MAP_ALL_ACCESS, 0, 0, 2 * K64).Value as usize;
+            assert!(a != 0 && b != 0);
+            title_memory_view(a, 2 * K64, 0x5151, 0);
+            title_memory_view(b, 2 * K64, 0x5151, 0);
+            assert!(aliased(a + 100, 4096));
+            assert_eq!(alias_ranges(a + 100, 4096), vec![(b + 100, b + 100 + 4096)]);
+            let (first, _) = crate::watch::writes(b + 100, b + 100 + 4096, true).expect("view memory is guarded");
+            let (_, quiet) = crate::watch::writes(b + 100, b + 100 + 4096, true).unwrap();
+            assert!(quiet.iter().all(|&(_, w)| w <= first + 1), "nothing written since guarding: {quiet:?}");
+            let before = crate::watch::writes(b + 100, b + 100 + 4096, true).unwrap().0;
+            // The title writes through B; A shows it.
+            std::ptr::write_volatile((b + 200) as *mut u8, 0x5a);
+            assert_eq!(std::ptr::read_volatile((a + 200) as *const u8), 0x5a);
+            let (_, written) = crate::watch::writes(b + 100, b + 100 + 4096, true).unwrap();
+            assert!(written.iter().any(|&(_, w)| w > before), "the write through B is seen: {written:?}");
+            views_gone(a, 2 * K64);
+            views_gone(b, 2 * K64);
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void });
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut c_void });
+            windows_sys::Win32::Foundation::CloseHandle(handle);
         }
     }
 }

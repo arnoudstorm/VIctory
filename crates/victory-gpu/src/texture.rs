@@ -71,6 +71,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// With `VICTORY_ALIAS_GUARD=1`: the other views of its bytes that were
+    /// guarded at the last check ([`crate::inplace::alias_ranges`]).
+    alias_guarded: Vec<(usize, usize)>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -395,6 +398,15 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 
 /// Only owned copied bytes reach the callback. Direct reads keep their
 /// protection for their whole lifetime; no memory-stability check is skipped.
+/// `VICTORY_ALIAS_GUARD=1` (off by default): textures shown through other
+/// views too are guarded through those views as well, and hashed only when
+/// a write is seen, instead of at every check (113-134 MB a frame of hashing
+/// in Test #36, nearly all of it for such textures).
+fn alias_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_GUARD").is_some_and(|v| v == "1"))
+}
+
 fn with_stable_copy<R>(memory:*const u8,size:usize,guard:crate::watch::Reading,early:bool,f:impl FnOnce(&[u8])->R)->R{
     with_title(memory,size,|read|{
         let held=if early{drop(guard);None}else{Some(guard)};
@@ -811,7 +823,8 @@ impl Staging {
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let before = last.asked;
+            let unwritten = before != 0 && written.iter().all(|&(_, w)| w <= before);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             // Pages another view shows too are written through that view
@@ -821,7 +834,29 @@ impl Staging {
             // each slot showed the frame of its last ring cycle for up to
             // eight frames, a strobe of up to 29 reversals a second.
             let aliased = crate::inplace::aliased(start, size);
-            if unwritten && !turn && !aliased {
+            // `VICTORY_ALIAS_GUARD=1`: the other views of its bytes are
+            // guarded too, so a write through them is seen as one through
+            // the texture's own pages; the texture is hashed only when one
+            // of them was written (or a view of them is new since the last
+            // check, its writes before then unseen).
+            let quiet_aliases = aliased && alias_guard() && {
+                let others = crate::inplace::alias_ranges(start, size);
+                let mut quiet = unwritten && others == last.alias_guarded;
+                let mut guarded = true;
+                for &(a, b) in &others {
+                    match crate::watch::writes(a, b, true) {
+                        Some((_, w)) => quiet &= w.iter().all(|&(_, w)| w <= before),
+                        None => guarded = false,
+                    }
+                }
+                last.alias_guarded = if guarded { others } else { Vec::new() };
+                quiet && guarded
+            };
+            if unwritten && !turn && (!aliased || quiet_aliases) {
+                #[cfg(feature = "diagnostics")]
+                if aliased {
+                    crate::copystat::add(crate::copystat::C::TexAliasQuiet, size as u64);
+                }
                 return 0;
             }
             #[cfg(feature = "diagnostics")]

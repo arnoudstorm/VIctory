@@ -89,6 +89,9 @@ pub(crate) enum C {
     TexHashWritten,
     TexHashTurn,
     TexHashPartial,
+    /// Bytes of aliased textures not hashed because neither their pages nor
+    /// the other views of them were written (`VICTORY_ALIAS_GUARD=1`).
+    TexAliasQuiet,
     /// Frames presented since the last line (what the line divides by).
     Frames,
     /// Calls of list methods that record into a host list, and the
@@ -1239,7 +1242,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed (hashed because: no guard {:.1} MB,          aliased {:.1} MB, guard saw a write {:.1} MB, eighth-frame turn {:.1} MB, partly mapped          {:.1} MB)",
+         changed, {:.1} MB hashed, {:.1} MB of them changed (hashed because: no guard {:.1} MB,          aliased {:.1} MB, guard saw a write {:.1} MB, eighth-frame turn {:.1} MB, partly mapped          {:.1} MB); aliased and quiet, not hashed {:.1} MB",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1268,6 +1271,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashWritten as usize]),
         mb(c[C::TexHashTurn as usize]),
         mb(c[C::TexHashPartial as usize]),
+        mb(c[C::TexAliasQuiet as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
