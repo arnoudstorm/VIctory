@@ -95,9 +95,18 @@ fn record_at(api: &'static str, address: usize, bytes: usize, flags: u32, result
         let event = Event { api,address,bytes,flags,result,error,heap,offset,stack,sequence:0,
             thread: unsafe { GetCurrentThreadId() },
             utc_us: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() };
-        match recorder.queue.0.try_lock(){
-            Ok(mut queue)=>{if let Some(lost)=queue.admit(event){dropped(&lost)};drop(queue);recorder.queue.1.notify_one();}
-            Err(_)=>dropped(&event),
+        // Coarse VM/heap events must not be lost just because the writer is
+        // moving a batch. The writer holds this lock only for an in-memory
+        // drain (at most 256 events), never for formatting, I/O or waiting.
+        if event.critical() {
+            let mut queue=recorder.queue.0.lock().unwrap_or_else(|e|e.into_inner());
+            if let Some(lost)=queue.admit(event){dropped(&lost)}
+            drop(queue);recorder.queue.1.notify_one();
+        } else {
+            match recorder.queue.0.try_lock(){
+                Ok(mut queue)=>{if let Some(lost)=queue.admit(event){dropped(&lost)};drop(queue);recorder.queue.1.notify_one();}
+                Err(_)=>dropped(&event),
+            }
         }
     }
     unsafe { SetLastError(error) };
