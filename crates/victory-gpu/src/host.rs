@@ -2016,7 +2016,44 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, join_copy_ranges, join_ranges, landable, touches_other};
+    use super::{Late, Line, flagged_pieces, join_copy_ranges, join_ranges, landable, touches_other};
+
+    fn empty_line() -> Line {
+        Line {
+            line: Vec::new(),
+            written: Vec::new(),
+            by_copy: Vec::new(),
+            lists: 0,
+            target: 0,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+        }
+    }
+
+    /// A wait for a memory value is over once nothing in the air or being
+    /// landed may write its bytes: shader ranges, writes behind a flight,
+    /// and writes being landed each keep it; other memory does not.
+    #[test]
+    fn a_value_wait_holds_only_for_flights_that_may_write_it() {
+        use crate::queue::Written;
+        let mut line = empty_line();
+        assert!(!line.may_write(0x1000, 0x1008));
+        line.written = vec![(0x2000, 0x3000)];
+        assert!(!line.may_write(0x1000, 0x1008));
+        assert!(line.may_write(0x2ff8, 0x3000));
+        assert!(!line.may_write(0x3000, 0x3008));
+        line.line.push(Late::Write(0x1004, Written::Value(1), 4));
+        assert!(line.may_write(0x1000, 0x1008));
+        line.line.clear();
+        line.in_hand.push((0x1000, Written::GpuTimestamp, 8));
+        assert!(line.may_write(0x1000, 0x1008));
+        assert!(!line.may_write(0x1008, 0x1010));
+        line.in_hand.clear();
+        line.line.push(Late::Signal(0x1000, 7));
+        assert!(!line.may_write(0x1000, 0x1008));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2195,6 +2232,14 @@ impl Line {
             }));
         join_ranges(&mut out, all);
         out
+    }
+
+    /// Whether a flight still in the air or being landed may write title
+    /// memory in `from..to`: its shaders or read-backs ([`Line::written`],
+    /// which keeps a landing's flights until it is done) or a bottom-of-pipe
+    /// write ([`Line::immed_writes`]).
+    fn may_write(&self, from: usize, to: usize) -> bool {
+        touches(&self.written, from, to) || touches(&self.immed_writes(), from, to)
     }
 }
 
@@ -2525,7 +2570,14 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
             return false;
         }
     }
-    settle_now(WHY_VALUE);
+    if relay_exact() {
+        // Only until no flight that may write the value is in the air or
+        // being landed (as for title memory reads): the card's other work
+        // and the flights behind are not waited for.
+        relay_wait(WHY_VALUE, |line| !line.may_write(address, address + bytes));
+    } else {
+        settle_now(WHY_VALUE);
+    }
     wait.met()
 }
 
