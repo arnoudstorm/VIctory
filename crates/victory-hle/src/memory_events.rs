@@ -19,6 +19,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 fn recorder() -> Option<&'static Recorder> {
     RECORDER.get_or_init(|| {
         let path = std::env::var_os("VICTORY_MEMORY_EVENTS")?;
+        victory_core::ensure_outside_repo(std::path::Path::new(&path)).ok()?;
         let file = std::fs::File::create(path).ok()?;
         crate::memory_regions::start();
         let stack_min = std::env::var("VICTORY_MEMORY_STACK_MIN_MB").ok()

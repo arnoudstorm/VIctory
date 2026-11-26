@@ -13,6 +13,7 @@ pub(crate) fn start_allocation_sampler() {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
         let Some(path) = std::env::var_os("VICTORY_ALLOCATION_LOG") else { return };
+        if victory_core::ensure_outside_repo(std::path::Path::new(&path)).is_err() { return }
         let _ = std::thread::Builder::new().name("allocation-samples".into()).spawn(move || {
             use std::io::Write;
             let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };

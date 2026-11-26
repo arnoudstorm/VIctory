@@ -82,6 +82,7 @@ pub(crate) fn start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(path) = std::env::var_os("VICTORY_MEMORY_REGIONS") else { return };
+        if victory_core::ensure_outside_repo(std::path::Path::new(&path)).is_err() { return }
         let Ok(file) = std::fs::File::create(path) else { return };
         let _ = std::thread::Builder::new().name("memory-regions".into()).spawn(move || {
             use std::io::Write;
