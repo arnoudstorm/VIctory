@@ -67,6 +67,9 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Pipelines made although the library holds their name: the load was
+/// refused (the stored description differs) and so was the store.
+pub(crate) static REMADE: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -560,8 +563,27 @@ pub(crate) fn pipeline(
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) } {
+        Ok(()) => {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(stored) => {
+            // The name is held but its pipeline did not load: it is made
+            // again at every start. The first few are named with both
+            // errors so the part of the description that differs can be
+            // found.
+            let n = REMADE.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                let label = LABEL.with(|l| l.borrow().clone());
+                tracing::info!(
+                    name,
+                    label,
+                    load = %refused,
+                    store = %stored,
+                    "pipeline library: made a pipeline it holds under the same name and could not load"
+                );
+            }
+        }
     }
     Ok(pso)
 }
@@ -738,6 +760,7 @@ pub(crate) fn save(now: bool) {
             bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
+            remade = REMADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
