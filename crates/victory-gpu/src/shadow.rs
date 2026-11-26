@@ -26,6 +26,8 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    #[cfg(feature = "diagnostics")]
+    _allocation: crate::allocation_telemetry::Lifetime,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -106,6 +108,8 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    #[cfg(feature = "diagnostics")]
+    _allocation: crate::allocation_telemetry::Lifetime,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -166,6 +170,12 @@ fn card_limits() -> (u64, u64) {
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn allocation_card_bytes() -> [u64; 3] {
+    [CARD_BYTES[0].load(Ordering::Relaxed), CARD_BYTES[1].load(Ordering::Relaxed),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed)]
+}
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
@@ -1814,6 +1824,9 @@ impl Shadow {
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
+            #[cfg(feature = "diagnostics")]
+            _allocation: crate::allocation_telemetry::Lifetime::new(
+                "shadow_create", if data.is_null() || data as u64 == start { 0 } else { len }, 0),
             buffer,
             data,
             gpu,
@@ -2974,6 +2987,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    #[cfg(feature = "diagnostics")]
+                    _allocation: crate::allocation_telemetry::Lifetime::new("card_create", size, 0),
                 };
                 (on_card, Some(card))
             }
@@ -3238,6 +3253,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                #[cfg(feature = "diagnostics")]
+                _allocation: crate::allocation_telemetry::Lifetime::new("card_create", len, 1),
             };
             (on_card, Some(card))
         }

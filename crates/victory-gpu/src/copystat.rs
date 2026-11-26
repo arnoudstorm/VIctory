@@ -593,7 +593,7 @@ mod own_tests {
 
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
-fn process_memory() -> (u64, u64) {
+pub(crate) fn process_memory() -> (u64, u64) {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -609,7 +609,7 @@ fn process_memory() -> (u64, u64) {
 
 /// The PC's memory in bytes: physical memory free, and what is left to
 /// commit.
-fn system_memory() -> (u64, u64) {
+pub(crate) fn system_memory() -> (u64, u64) {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };

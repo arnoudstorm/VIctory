@@ -1196,6 +1196,8 @@ pub(crate) struct HostTexture {
     /// [`KINDS`] while it lives.
     filled: bool,
     memory_class: usize,
+    #[cfg(feature = "diagnostics")]
+    _allocation: crate::allocation_telemetry::Lifetime,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1777,6 +1779,8 @@ impl HostTexture {
             bytes,
             filled: false,
             memory_class,
+            #[cfg(feature = "diagnostics")]
+            _allocation: crate::allocation_telemetry::Lifetime::new("texture_create", bytes, memory_class as u64),
         }
     }
 }

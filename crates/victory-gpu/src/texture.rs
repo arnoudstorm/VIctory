@@ -33,6 +33,8 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
+    #[cfg(feature = "diagnostics")]
+    allocation: crate::allocation_telemetry::Lifetime,
     buffer: ID3D12Resource,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -688,6 +690,12 @@ impl Staging {
             .fetch_max(submission, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_copy(&self, submission: u64) -> u64 {
+        self.allocation.used_by(submission);
+        self.bytes
+    }
+
     /// The highest late submission number that may still be reading this
     /// staging buffer on the GPU (`0` if none).
     pub(crate) fn in_flight(&self) -> u64 {
@@ -1330,6 +1338,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
+        #[cfg(feature = "diagnostics")]
+        allocation: crate::allocation_telemetry::Lifetime::new("staging_create", total, 0),
         buffer,
         data,
         footprints,

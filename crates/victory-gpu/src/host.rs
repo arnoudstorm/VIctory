@@ -223,6 +223,13 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn allocation_fence_snapshot() -> (u64, u64, u64) {
+    // SAFETY: a query on the live host fence. Device removal returns UINT64_MAX.
+    let completed = host().map_or(0, |host| unsafe { host.fence.GetCompletedValue() });
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire), completed)
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {
@@ -1728,6 +1735,8 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    #[cfg(feature = "diagnostics")]
+    upload: (u64, u64),
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4041,6 +4050,8 @@ impl Host {
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
+        let _ = crate::allocation_telemetry::enabled();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::start_allocation_sampler();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -4313,6 +4324,8 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut upload = (0u64, 0u64);
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4332,6 +4345,11 @@ impl Host {
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                upload.0 += 1;
+                                upload.1 += (b - a) as u64;
+                            }
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         let Some(before) = before else {
@@ -4386,6 +4404,8 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            #[cfg(feature = "diagnostics")]
+            upload,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5327,6 +5347,10 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(runs, flown);
+        #[cfg(feature = "diagnostics")]
+        if let Some(plan) = &card && plan.upload.0 != 0 {
+            crate::allocation_telemetry::note("card_uploads", this_submission, plan.upload.1, plan.upload.0);
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -5335,15 +5359,26 @@ impl Host {
         // the card ([`crate::texture::Staging::take_recorded`]); the flag is
         // cleared for every submission, waited for or not.
         // `VICTORY_STAGING_MARK_ALL=1`: every staging buffer named, as before.
+        #[cfg(feature = "diagnostics")]
+        let mut copies = (0u64, 0u64);
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::Texture(staging) = step
-                    && (staging.take_recorded() || mark_all_staging())
-                    && late
-                {
-                    staging.mark_in_flight(this_submission);
+                if let Step::Texture(staging) = step {
+                    let recorded = staging.take_recorded();
+                    #[cfg(feature = "diagnostics")]
+                    if recorded && crate::allocation_telemetry::enabled() {
+                        copies.0 += 1;
+                        copies.1 += staging.note_copy(this_submission);
+                    }
+                    if (recorded || mark_all_staging()) && late {
+                        staging.mark_in_flight(this_submission);
+                    }
                 }
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if copies.0 != 0 {
+            crate::allocation_telemetry::note("texture_copies", this_submission, copies.1, copies.0);
         }
         if late {
             *submitted += 1;
@@ -5356,8 +5391,12 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
-            if let Err(e) = signalled {
+            if let Err(ref e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+            }
+            #[cfg(feature = "diagnostics")]
+            if signalled.is_ok() {
+                crate::allocation_telemetry::note("submission_fence", this_submission, 0, *submitted);
             }
             let back = declared_writes(runs);
             let backs: Vec<(usize, usize)> = runs
@@ -5414,7 +5453,13 @@ impl Host {
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    .and_then(|()| {
+                        #[cfg(feature = "diagnostics")]
+                        if i + 1 == groups.len() {
+                            crate::allocation_telemetry::note("submission_fence", this_submission, 0, *submitted);
+                        }
+                        self.fence.SetEventOnCompletion(*submitted, self.event)
+                    });
                 match waited {
                     Ok(()) => {
                         working(false);
