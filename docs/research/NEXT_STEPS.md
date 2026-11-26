@@ -130,3 +130,9 @@ Run #6 consumed the authorized launch and ended on the memory guard at72.711s. D
 5. Resume actual input/movement/world verification first, then matched release reuse0/1 or refresh1/16, one flag per A/B, same caches/settings/power/route and100ms safety. Need per-present timings for percentiles. Previous5:40gameplay record unchanged; Run6gameplay0.
 
 Exact next-run preview and guarded launch instructions are outside repo in outputs/phase6-next-test.ps1 (default preview only; -Run only after next authorization). Full findings/limitations: outputs/phase6-development-and-run6.md. No further gameplay milestone claimed.
+
+## Current queue after Phases 7–10
+
+Final runtime source f43ae7fbaeb604679f022f3052930f0eaee5161b. Run7/8stopped on immediate memory guard,0gameplay. Runs9/10withheld under repeated-danger condition; no Run11. Preserve final unlaunched candidates/provenance and all prior binaries. Protected laptop/780m unchanged. Current dataset includes unknown Run1–4 identifiers instead of mapping historical tests by guess; no missing values plotted as zero.
+
+Next work: establish actual safe physical headroom (normal optional-app Exit only if idle verified; no forced closure); close native terminal-allocation coverage/complete-snapshot gap; correlate second174MiBregion by identity, not size; keep arena semantics and GPU/replay/fence lifetimes. Existing DS retained capacity is small and mutex acquisition negligible in Run7; do not enlarge caps or claim scratch pooling fixes startup. Keep copied-read unlock defaultoff until actual-workload incidence and correctness measured. Add targeted replacement/replay/error fixtures before enabling. Resume input/world proof before gameplay A/B; no per-present FPS percentile currently available. Historical340s/2.1FPS remain historical. Full audit/roadmap outside repository.
