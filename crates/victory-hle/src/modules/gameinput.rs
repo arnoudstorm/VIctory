@@ -1207,6 +1207,8 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        #[cfg(feature = "diagnostics")]
+        last_pad: [Option<PadState>; PADS],
     }
 
     impl Source for Host {
@@ -1218,21 +1220,58 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                #[cfg(feature = "diagnostics")]
+                if self.last_pad[slot].take().is_some() && input_log() {
+                    tracing::info!(slot, "XInput gamepad disconnected");
+                }
                 return None;
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            // Keyboard stand-in buttons also press the first real pad's
+            // buttons. With a real pad connected the stand-in pad is not
+            // exposed, while this title still listens only to the pad at
+            // its start and pause screens. Keep Enter/Escape and the other
+            // documented fallback controls working in that configuration.
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                #[cfg(feature = "diagnostics")]
+                let scripted = scripted();
+                let focused = focused();
+                for &(vk, button) in &super::FALLBACK_BUTTONS {
+                    // SAFETY: a plain key-state query.
+                    let live = focused && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+                    #[cfg(feature = "diagnostics")]
+                    let down = live || scripted.contains(&vk);
+                    #[cfg(not(feature = "diagnostics"))]
+                    let down = live;
+                    if down {
                         pad.buttons |= button;
                     }
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                let previous = self.last_pad[slot].replace(pad);
+                if input_log()
+                    && previous.is_none_or(|old| {
+                        old.buttons != pad.buttons
+                            || old.left_trigger != pad.left_trigger
+                            || old.right_trigger != pad.right_trigger
+                    })
+                {
+                    tracing::info!(
+                        slot,
+                        connected = previous.is_none(),
+                        buttons = format_args!("{:#x}", pad.buttons),
+                        left_trigger = pad.left_trigger,
+                        right_trigger = pad.right_trigger,
+                        left_x = pad.left_x,
+                        left_y = pad.left_y,
+                        right_x = pad.right_x,
+                        right_y = pad.right_y,
+                        "XInput gamepad state"
+                    );
                 }
             }
             Some(pad)
@@ -1273,6 +1312,15 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// Logs XInput connection and button/trigger changes in diagnostics
+    /// builds (`VICTORY_INPUT_LOG=1`). Stick jitter is included in those
+    /// records but does not create a new record on its own.
+    #[cfg(feature = "diagnostics")]
+    fn input_log() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_INPUT_LOG").is_some_and(|v| v == "1"))
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
