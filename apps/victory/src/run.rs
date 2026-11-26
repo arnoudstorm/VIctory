@@ -4,6 +4,78 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Opt-in code patches, `VICTORY_PATCH=rva=hexbytes[:expected],...`: each
+/// writes `hexbytes` at that RVA of the prepared copy (never the game's
+/// files), and only when the original bytes start with `expected`, so a
+/// patch made for one build is refused on another. Unset or empty: none.
+///
+/// Example: `0x28d0d60=31c0c3:ffc9f7c1f7ffffff0f94c0c3` makes the story
+/// save encryption check of build 1.0.2.1 answer "no" (`xor eax,eax; ret`),
+/// so unencrypted saves converted from other consoles load. Format from
+/// LilBigJP/ztrx-ps5-save-import (GPL-3.0-or-later).
+fn apply_byte_patches(prepared: &mut victory_loader::PreparedImage) -> Result<()> {
+    let spec = std::env::var("VICTORY_PATCH").unwrap_or_default();
+    for (rva, new, expected) in parse_patches(&spec)? {
+        let off = prepared
+            .info
+            .rva_to_file_offset(rva)
+            .with_context(|| format!("VICTORY_PATCH rva {rva:#x} is not file-backed"))?
+            as usize;
+        let len = new.len().max(expected.len());
+        let slot = prepared
+            .bytes
+            .get_mut(off..off + len)
+            .with_context(|| format!("VICTORY_PATCH rva {rva:#x} outside the image"))?;
+        anyhow::ensure!(
+            slot.starts_with(&expected),
+            "VICTORY_PATCH rva {rva:#x}: found {:02x?}, expected {:02x?}; not patching",
+            &slot[..expected.len()],
+            expected
+        );
+        println!("patch          {rva:#x}: {:02x?} -> {:02x?}", &slot[..new.len()], new);
+        slot[..new.len()].copy_from_slice(&new);
+    }
+    Ok(())
+}
+
+/// `VICTORY_PATCH`'s items: RVA, new bytes, expected original bytes.
+fn parse_patches(spec: &str) -> Result<Vec<(u32, Vec<u8>, Vec<u8>)>> {
+    let hex = |s: &str| -> Result<Vec<u8>> {
+        anyhow::ensure!(s.len() % 2 == 0 && !s.is_empty(), "bad hex in VICTORY_PATCH: {s:?}");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("bad hex in VICTORY_PATCH"))
+            .collect()
+    };
+    spec.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|item| {
+            let (at, rest) = item.split_once('=').context("a VICTORY_PATCH item needs rva=bytes:expected")?;
+            let rva = u32::from_str_radix(at.trim().trim_start_matches("0x"), 16).context("bad rva in VICTORY_PATCH")?;
+            let (new, expected) = rest
+                .split_once(':')
+                .context("a VICTORY_PATCH item needs the expected original bytes after ':'")?;
+            Ok((rva, hex(new)?, hex(expected)?))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::parse_patches;
+
+    #[test]
+    fn patches_parse_and_need_the_original_bytes() {
+        assert!(parse_patches("").unwrap().is_empty());
+        let p = parse_patches("0x28d0d60=31c0c3:ffc9f7c1").unwrap();
+        assert_eq!(p, vec![(0x28d0d60, vec![0x31, 0xc0, 0xc3], vec![0xff, 0xc9, 0xf7, 0xc1])]);
+        assert!(parse_patches("0x10=31c0c3").is_err());
+        assert!(parse_patches("0x10=31c:ff").is_err());
+        assert!(parse_patches("zz=31:ff").is_err());
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -20,7 +92,8 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
+    apply_byte_patches(&mut prepared)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
