@@ -163,6 +163,11 @@ mod tests {
         assert_eq!(virtual_alloc(base,1 << 20,win::MEM_COMMIT,win::PAGE_READWRITE),base);
         assert_ne!(virtual_free(base,1 << 20,win::MEM_DECOMMIT),0);
         assert_ne!(virtual_free(base,0,win::MEM_RELEASE),0);
+        let process=unsafe {windows_sys::Win32::System::Threading::GetCurrentProcess()};
+        let base=virtual_alloc_ex(process,std::ptr::null(),65536,win::MEM_RESERVE|win::MEM_COMMIT,win::PAGE_READWRITE);
+        assert!(!base.is_null());assert_ne!(virtual_free_ex(process,base,0,win::MEM_RELEASE),0);
+        let base=virtual_alloc2(process,std::ptr::null(),65536,win::MEM_RESERVE|win::MEM_COMMIT,win::PAGE_READWRITE,std::ptr::null_mut(),0);
+        assert!(!base.is_null());assert_ne!(virtual_free_ex(process,base,0,win::MEM_RELEASE),0);
     }
     #[test]
     fn observed_native_heap_realloc_keeps_bytes_and_last_error() {
