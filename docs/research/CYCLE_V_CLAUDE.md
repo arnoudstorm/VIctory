@@ -279,11 +279,55 @@ each texture was hashed (no guard, aliased, the guard saw a write, the
 eighth-frame turn, partly mapped), to cut the 110 ms a frame of texture
 hashing in #33, which found 0 MB changed.
 
+## Test #36 (`2ded7c88`, loop limit default, `VICTORY_PIPELINE_WORKERS=2`): stopped by hand
+
+| | |
+|---|---|
+| Outcome | stopped by hand (the manual stop file) at 8.8 min, at the user's request |
+| World | first frame at 2.1 min (frame 2587; #35: 2.5 min), then the HUD (health, stamina, focus) and the tip text (the user saw both), 3D black |
+| Why black | recording waited about **500 ms a frame for pipelines**: some 600 draws a frame, their pipelines not built yet. Shaders translated: 1,136 by the stop; translation slowed to ~15 a minute late in the run |
+| Memory | lowest 1 MiB; 7 dips at or below 64 MiB, all recovered (the longest 0.3 s); no emergency |
+| Texture hashing (91 samples) | 91 MB a frame on average; in the world 113-134 MB, **of which 113-134 MB "aliased"** (counters from `2ded7c88`) |
+
+With 2 workers the run held its memory but could not fill the cache in
+time to draw the world. No answer yet on hair and skin.
+
+## Change: `VICTORY_ALIAS_GUARD` (`be1ca828`, opt-in)
+
+The counters show nearly all texture hashing is for textures whose bytes
+another view shows too (`inplace::aliased`), hashed at every check since
+the flicker fix because a write through that other view has no guard of
+ours. With `VICTORY_ALIAS_GUARD=1` the other views' address ranges of the
+same bytes (`inplace::alias_ranges`, byte for byte) are guarded as well
+(`watch::writes(.., true)`), and the texture is hashed only when its own
+pages or those ranges were written, or the set of other views changed.
+The every-eighth-frame turn still hashes every texture, as a backstop.
+
+Tests: other views are found byte for byte (unit); a write through a
+second real view of a section is seen by its guard (real Windows
+section, two `MapViewOfFile` views). Suite: 581 passed, 0 failed.
+Not yet measured in the title, and the flicker audit must be repeated
+with it before it can be a default.
+
+## Runs #30-#37 at a glance
+
+| Run | Build / change | End | Furthest stage | World fps |
+|---|---|---|---|---|
+| #30 | `4e9052e7`, shared tiles | emergency stop, ~147 s | loading | — |
+| #31 | same | emergency stop, ~104 s | loading | — |
+| #32 | `dc567b92`, structurizer cap, 2 s floor | **600 s cap** | world 410 s | 1.40 |
+| #33 | same, cache partly warm | **device removed**, ~4.8 min | world from 163 s | 1.50 |
+| #34 | same, compile gate 1,024 MiB, capture | **600 s cap** | world ~510 s; Lucia: hair streaks, black skin | **2.10** |
+| #35 | loop limit default (cold cache) | emergency stop, ~4.4 min | world's first frame, then black (shaders) | — |
+| #36 | `2ded7c88`, 2 pipeline workers | stopped by hand, 8.8 min | world: HUD and tip, 3D black (pipelines) | — |
+| #37 | `be1ca828`, alias guard, 8 workers, 20 min cap | running | | |
+
 ## Next
 
-1. Test #36: #35 again (loop limit default, the cache now partly warm)
-   with `VICTORY_PIPELINE_WORKERS=2`, to answer the hair and skin
-   question.
+1. Test #37: loop limit default with the cache now holding #35-#36's
+   translations, 8 workers, `VICTORY_ALIAS_GUARD=1`, more world frames
+   saved. Answers the hair and skin question if the world draws, and
+   measures the alias guard.
 2. If the picture is still wrong: a run with `VICTORY_DUMP_TARGETS=1` on
    one Lucia frame, to find the pass.
 3. A shared-tiles off/on pair with capture (the 579 MiB claim, and
