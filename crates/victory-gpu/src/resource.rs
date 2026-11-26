@@ -672,21 +672,86 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
-    /// For a read back through a host buffer: this footprint at offset 0
-    /// with its rows pitched as the host wants them (multiples of 256
-    /// bytes), then the bytes that buffer needs, the bytes of a row, the
-    /// rows, and the title's own pitch.
-    pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+    /// For a read back through a host buffer: the part the copy writes at
+    /// offset 0, with its rows pitched as the host wants them. A source box
+    /// makes the host footprint only as large as that box: bytes outside a
+    /// texture copy must stay untouched in the title's destination buffer.
+    pub(crate) fn host_rows(
+        &self,
+        source_box: Option<[u32; 6]>,
+    ) -> Option<(PlacedFootprint, ReadBackRows)> {
         let (element, block) = element(self.format)?;
-        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
-        let row = u64::from(self.width).div_ceil(block) * element;
-        let pitch = row.max(1).next_multiple_of(256);
+        let [left, top, front, right, bottom, back] = source_box.unwrap_or([
+            0,
+            0,
+            0,
+            self.width,
+            self.height,
+            self.depth,
+        ]);
+        let width = right.checked_sub(left)?;
+        let height = bottom.checked_sub(top)?;
+        let depth = back.checked_sub(front)?;
+        if width == 0
+            || height == 0
+            || depth == 0
+            || width > self.width
+            || height > self.height
+            || depth > self.depth
+        {
+            return None;
+        }
+        let rows_per_slice = u64::from(height).div_ceil(block);
+        let destination_rows_per_slice = u64::from(self.height).div_ceil(block);
+        let row_bytes = u64::from(width).div_ceil(block) * element;
+        let host_pitch = row_bytes.max(1).next_multiple_of(256);
         let host = PlacedFootprint {
             offset: 0,
-            row_pitch: u32::try_from(pitch).ok()?,
+            width,
+            height,
+            depth,
+            row_pitch: u32::try_from(host_pitch).ok()?,
             ..*self
         };
-        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
+        let rows = ReadBackRows {
+            size: host_pitch
+                .checked_mul(rows_per_slice)?
+                .checked_mul(u64::from(depth))?,
+            row_bytes,
+            rows_per_slice,
+            slices: u64::from(depth),
+            host_pitch,
+            destination_pitch: u64::from(self.row_pitch),
+            destination_rows_per_slice,
+        };
+        Some((host, rows))
+    }
+}
+
+/// How rows copied into a compact host readback buffer map back into the
+/// title's placed footprint. A boxed 3D copy is compact on the host but its
+/// destination slices keep the original footprint's height and row pitch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadBackRows {
+    pub(crate) size: u64,
+    pub(crate) row_bytes: u64,
+    pub(crate) rows_per_slice: u64,
+    pub(crate) slices: u64,
+    pub(crate) host_pitch: u64,
+    pub(crate) destination_pitch: u64,
+    pub(crate) destination_rows_per_slice: u64,
+}
+
+impl ReadBackRows {
+    /// Bytes from the destination pointer through the last byte copied.
+    pub(crate) fn destination_span(self) -> Option<u64> {
+        let last_slice = self.slices.checked_sub(1)?;
+        let last_row = self.rows_per_slice.checked_sub(1)?;
+        last_slice
+            .checked_mul(self.destination_rows_per_slice)?
+            .checked_add(last_row)?
+            .checked_mul(self.destination_pitch)?
+            .checked_add(self.row_bytes)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -2436,6 +2501,51 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[test]
+    fn boxed_readbacks_copy_only_the_box_and_keep_destination_slice_stride() {
+        let placed = PlacedFootprint {
+            offset: 4096,
+            format: 28, // RGBA8
+            width: 16,
+            height: 8,
+            depth: 2,
+            row_pitch: 256,
+        };
+        let (host, rows) = placed.host_rows(Some([4, 2, 0, 12, 6, 2])).unwrap();
+        assert_eq!((host.offset, host.width, host.height, host.depth), (0, 8, 4, 2));
+        assert_eq!(host.row_pitch, 256);
+        assert_eq!(
+            rows,
+            ReadBackRows {
+                size: 2048,
+                row_bytes: 32,
+                rows_per_slice: 4,
+                slices: 2,
+                host_pitch: 256,
+                destination_pitch: 256,
+                destination_rows_per_slice: 8,
+            }
+        );
+        assert_eq!(rows.destination_span(), Some(2848));
+    }
+
+    #[test]
+    fn readback_boxes_must_be_nonempty_and_fit_the_destination_footprint() {
+        let placed = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 16,
+            height: 8,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert!(placed.host_rows(Some([0, 0, 0, 0, 1, 1])).is_none());
+        assert!(placed.host_rows(Some([0, 0, 0, 17, 1, 1])).is_none());
+        let (host, rows) = placed.host_rows(None).unwrap();
+        assert_eq!((host.width, host.height, host.depth), (16, 8, 1));
+        assert_eq!(rows.destination_span(), Some(1856));
     }
 
     fn heap(size: u64) -> This {

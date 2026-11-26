@@ -1763,9 +1763,8 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Textures read back (texture to buffer copies), done once the list
     /// has run: the host buffer the list copies the texels into, the title
-    /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// memory they go to, and the compact host-to-title row layout.
+    backs: Vec<(ID3D12Resource, usize, crate::resource::ReadBackRows)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -3718,7 +3717,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    for (buffer, at, rows) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -3726,8 +3725,20 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                for slice in 0..rows.slices as usize {
+                    for line in 0..rows.rows_per_slice as usize {
+                        let source = slice * rows.rows_per_slice as usize * rows.host_pitch as usize
+                            + line * rows.host_pitch as usize;
+                        let destination = slice
+                            * rows.destination_rows_per_slice as usize
+                            * rows.destination_pitch as usize
+                            + line * rows.destination_pitch as usize;
+                        std::ptr::copy_nonoverlapping(
+                            from.add(source),
+                            (*at as *mut u8).add(destination),
+                            rows.row_bytes as usize,
+                        );
+                    }
                 }
                 buffer.Unmap(0, None);
             }
@@ -5184,10 +5195,9 @@ impl Host {
                     l.deferred()
                         .backs
                         .iter()
-                        .filter(|&&(_, _, [row, rows, _])| row > 0 && rows > 0)
-                        .map(|&(_, at, [row, rows, pitch])| {
-                            let span = rows.saturating_sub(1).saturating_mul(pitch).saturating_add(row);
-                            (at, at.saturating_add(span))
+                        .filter_map(|&(_, at, rows)| {
+                            let span = rows.destination_span()? as usize;
+                            Some((at, at.saturating_add(span)))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -6189,12 +6199,16 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
-    /// A read back: once the list has run, `rows` rows of `row` bytes go
-    /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
-    /// to title memory at `dst`, pitched `pitch`. The buffer lives until
-    /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    /// A read back: once the list has run, the compact rows in `buffer` go
+    /// to their corresponding rows and slices in title memory. The buffer
+    /// lives until the list is reset.
+    pub(crate) fn defer_read_back(
+        &self,
+        buffer: ID3D12Resource,
+        dst: *mut u8,
+        rows: crate::resource::ReadBackRows,
+    ) {
+        self.deferred().backs.push((buffer, dst as usize, rows));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

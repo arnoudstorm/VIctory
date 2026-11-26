@@ -1067,12 +1067,20 @@ fn read_back(
         return Err("a destination corner other than the footprint's");
     }
     let host = crate::host::host().ok_or("no host")?;
-    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+    // SAFETY: the title passes a box or null; copy its six integers while
+    // the call is in progress.
+    let source_box_values = unsafe { source_box.as_ref().copied() };
+    let (footprint, rows) = dst
+        .footprint
+        .host_rows(source_box_values)
+        .ok_or("an unknown format or invalid source box")?;
     // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
+    let bytes = rows
+        .destination_span()
+        .ok_or("an overflowing destination footprint")?;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    let buffer = host.read_back_buffer(rows.size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1089,8 +1097,14 @@ fn read_back(
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!(
-            "read back of {:?} sub {} into buffer {:?}+{:#x}: {rows} rows of {row} bytes",
-            src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
+            "read back of {:?} sub {} into buffer {:?}+{:#x}: {} slices of {} rows of {} bytes",
+            src.resource,
+            src.footprint.offset as u32,
+            dst.resource,
+            dst.footprint.offset,
+            rows.slices,
+            rows.rows_per_slice,
+            rows.row_bytes,
         )
     });
     // SAFETY: an open list; both locations in the host's layout (asserted
@@ -1100,7 +1114,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    list.defer_read_back(buffer, data, rows);
     Ok(())
 }
 
