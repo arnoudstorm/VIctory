@@ -190,6 +190,36 @@ recoverable; with dips allowed up to 2 s, the run lived to the cap. The
 differ in more than shared tiles (structurizer, cold cache, observer), so
 this is not an A/B of the 579 MiB claim.
 
+## Test #33 (same build as #32, cache partly warm)
+
+| Measurement | Result |
+|---|---|
+| Available at start | ~9.9 GB |
+| Termination | **device removed** (exit 0x887A0005; reason 0x887A0007, "the GPU will not respond", no breadcrumbs) about 4.8 min in |
+| Loading to first world frame | 163 s (Test #32: 187 s) |
+| World frames (n=59, ~7,440 draws) | 1.50 fps; frame 663 / 1,059 / 8,160 ms (p50/p90/p99); CPU 401 ms, GPU wait 196 ms |
+| Shader cache | 1,918 hits, 973 misses |
+| Process CPU in the world | 8.7 of 16 logical cores |
+| Dips at or below 64 MiB | 9, all recovered; the last two at 0-1 MiB for 0.6-0.9 s, seconds before the removal |
+| Captured frames | none: the launcher only sets capture with its `-CutsceneTest` key script, so the runner's capture switch did nothing (fixed in the runner) |
+
+What preceded the removal: the world moved to a new area (a few seconds at
+3 draws), then **64 driver pipeline compiles** (0.1-5.1 s each, up to eight
+at once; Test #32 had 6), most because the pipeline library refused its
+stored copy (0x80070057, likely entries saved with the previous
+translator's output), while available RAM touched 0. The formerly refused
+mesh pipeline `f5e50eb2108c425b` was in that batch but ran in Test #32
+without trouble, so it is not singled out. Most likely a GPU timeout under
+memory exhaustion during the compile burst; not proven, and shared tiles
+(on in both #32 and #33) are not excluded.
+
+What it teaches: with the 2 s floor the runtime survives dips, but a burst
+of concurrent driver compiles at an area change can still take the last
+memory. The runtime already has a gate for that,
+`VICTORY_COMPILE_MIN_AVAIL_MB` (driver compiles one at a time while
+available RAM is under the floor; off by default, and the runner cleared
+it). Next run: that gate at 1,024 MiB, with capture working.
+
 ## Next
 
 1. Test #33: same configuration with a warm shader cache (Test #32 filled
