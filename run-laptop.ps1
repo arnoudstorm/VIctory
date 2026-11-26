@@ -78,6 +78,10 @@ $profile = switch ($Preset) {
             CompileHeadroomMB = '3072'
             PreludePool = '1'
             ShaderLoopLimit = '64'
+            # Texture refreshes do not wait for remaps: on the 780M the
+            # worst frame-line "textures" fell from 195.5 ms to 5.5-6.1 ms in
+            # two guarded runs, with no texture failures.
+            TextureNoWait = '1'
         }
     }
     'lowmem' {
@@ -96,6 +100,7 @@ $profile = switch ($Preset) {
             PreludePool = '1'
             ShaderLoopLimit = '32'
             KeepSnapshotsMB = '64'
+            TextureNoWait = '1'
         }
     }
     'balanced' {
@@ -149,6 +154,7 @@ $settings = [ordered]@{
     VICTORY_TEXTURE_MIN_FREE_MB = $profile.TextureMinFreeMB
     VICTORY_COMPILE_HEADROOM_MB = $profile.CompileHeadroomMB
     VICTORY_SHADER_LOOP_LIMIT = $profile.ShaderLoopLimit
+    VICTORY_TEXTURE_NO_WAIT   = $(if ($profile.TextureNoWait) { $profile.TextureNoWait } else { '0' })
     VICTORY_FFX_BUILTIN       = '1'
     VICTORY_FFX_FILTER        = $(if ($Bilinear) { 'bilinear' } else { $profile.Filter })
     VICTORY_AMBIENT           = $(if ($NoAmbient) { 'off' } else { '0.6' })
