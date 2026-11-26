@@ -367,12 +367,27 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many workers: half the logical processors, 2 to 8, or
+/// `VICTORY_PIPELINE_WORKERS` (1 to 8). Each translates one shader at a
+/// time and holds its tables meanwhile, so fewer workers is less memory
+/// at the peak of a cold shader cache, and a longer wait for the shaders.
+fn worker_count(set: Option<&str>, logical: Option<usize>) -> usize {
+    if let Some(n) = set.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=8).contains(n)) {
+        return n;
+    }
+    logical.map_or(2, |n| (n / 2).clamp(2, 8))
+}
+
+/// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let set = std::env::var("VICTORY_PIPELINE_WORKERS").ok();
+        let workers = worker_count(set.as_deref(), std::thread::available_parallelism().ok().map(|n| n.get()));
+        if set.is_some() {
+            tracing::info!(workers, "pipeline workers (VICTORY_PIPELINE_WORKERS)");
+        }
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -510,5 +525,22 @@ mod tests {
         assert!(!early_ok_with(Some(1 << 30), floor));
         assert!(early_ok_with(None, floor), "unknown memory never stops the list");
         assert!(early_ok_with(Some(0), 0), "a floor of 0 turns the pause off");
+    }
+}
+
+#[cfg(test)]
+mod worker_count_tests {
+    use super::worker_count;
+
+    #[test]
+    fn pipeline_workers_follow_the_setting_within_one_to_eight() {
+        assert_eq!(worker_count(None, Some(16)), 8);
+        assert_eq!(worker_count(None, Some(6)), 3);
+        assert_eq!(worker_count(None, None), 2);
+        assert_eq!(worker_count(Some("2"), Some(16)), 2);
+        assert_eq!(worker_count(Some(" 1 "), Some(16)), 1);
+        assert_eq!(worker_count(Some("0"), Some(16)), 8);
+        assert_eq!(worker_count(Some("9"), Some(16)), 8);
+        assert_eq!(worker_count(Some("x"), Some(4)), 2);
     }
 }

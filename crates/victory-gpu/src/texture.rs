@@ -802,6 +802,10 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        // Why the texture is hashed below (diagnostics): no guard unless
+        // the guard says otherwise.
+        #[cfg(feature = "diagnostics")]
+        let mut why = crate::copystat::C::TexHashNoGuard;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -816,8 +820,14 @@ impl Staging {
             // three textures through other views: hashed every eighth frame,
             // each slot showed the frame of its last ring cycle for up to
             // eight frames, a strobe of up to 29 reversals a second.
-            if unwritten && !turn && !crate::inplace::aliased(start, size) {
+            let aliased = crate::inplace::aliased(start, size);
+            if unwritten && !turn && !aliased {
                 return 0;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::C;
+                why = if !unwritten { C::TexHashWritten } else if aliased { C::TexHashAliased } else { C::TexHashTurn };
             }
         }
         // From here on the texture's memory may be read in place. Held until
@@ -851,7 +861,10 @@ impl Staging {
             }
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            {
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                crate::copystat::add(crate::copystat::C::TexHashPartial, size as u64);
+            }
             let changed = with_stable_copy(self.memory,size,_mapped,copied_unlock(),|read| {
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
@@ -875,7 +888,10 @@ impl Staging {
             return with_stable_copy(self.memory,size,_mapped,copied_unlock(),|tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                {
+                    crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                    crate::copystat::add(why, size as u64);
+                }
                 if last.hash == Some(hash) {
                     return size;
                 }
@@ -891,7 +907,10 @@ impl Staging {
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        {
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            crate::copystat::add(why, size as u64);
+        }
         if last.hash == Some(hash) {
             return size;
         }

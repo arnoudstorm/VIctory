@@ -220,12 +220,71 @@ memory. The runtime already has a gate for that,
 available RAM is under the floor; off by default, and the runner cleared
 it). Next run: that gate at 1,024 MiB, with capture working.
 
+## Test #34 (same build, warm cache, compile gate 1,024 MiB, capture on)
+
+| | |
+|---|---|
+| Outcome | ran the full 600 s (deadline); no device removal |
+| World | from 85 s; 390 overlay samples in the world |
+| Frame, light scenes (300-4,000 draws, n=337) | 2.10 fps; p50 474 ms, p90 595 ms; CPU 273 ms, GPU wait 160 ms |
+| Frame, heavy scenes (4,000+ draws, n=53) | 1.90 fps; p50 530 ms; CPU 272 ms, GPU wait 194 ms |
+| RAM / VRAM in the world (p50) | 12.9 GB / 7,542 of 6,583 MB (over budget) |
+| Dips at or below 64 MiB | 9, all recovered, the longest 0.7 s |
+
+Faster than #32/#33 (1.40-1.50 fps); the compile gate and a warm cache
+are both in it, so the gain is not attributed to either alone.
+
+What the picture shows (frames 2113-2849, Lucia from the side at a
+railing):
+
+- **Hair:** strands spread into horizontal white streaks around the head,
+  wider as the shot goes on (2113 narrow, 2657 and 2849 wide). Something
+  that carries from frame to frame (the strand simulation's state) goes
+  wrong, not one frame's drawing.
+- **Skin:** face, arms and legs black with sparse bright speckles, while
+  the shirt beside them is lit. Not only the missing ray-traced light:
+  the speckles look like a skin pass whose recombination does not happen.
+- The ambient pass (`VICTORY_AMBIENT=0.6`) ran (log line at 22:12:20).
+
+Suspect: the lowmem preset's `VICTORY_SHADER_LOOP_LIMIT=32`. Translated
+loops leave after 32 iterations per lane; E22 found the limit gave no
+speed. A strand simulation or a skin kernel with longer loops would come
+out wrong silently. Not proven.
+
+## Test #35 (same, loop limit back to the default 2^20): stopped by the emergency watchdog
+
+The launcher (`work/run-laptop-card256.ps1`, outside the repo) takes
+`CLAUDE_SHADER_LOOP_LIMIT` for one run (0 is the default). Cap 900 s,
+because the loop limit is part of the shader cache key (a cold cache).
+
+The world's first frame came at 2.5 min (frame 3017), then the title
+waited on shaders (2 draws a frame, black screen with sound and the tip
+text, as the user saw). At 4.4 min available RAM stayed at 0 MiB for
+2 s and the emergency watchdog stopped it (private 13.9 GB, rising
+2 GB in 15 s while shaders were translated and the world streamed in).
+About 1,100 shaders were translated and cached by then. **No answer on
+the hair and skin.**
+
+## Change: `VICTORY_PIPELINE_WORKERS` (opt-in)
+
+The pipeline workers (half the logical processors, 2 to 8; 8 here)
+each translate one shader at a time and hold its tables meanwhile. The
+setting (1 to 8) lowers the peak of a cold cache at the cost of a longer
+wait. It is in `victory-gpu`, outside the translator's fingerprint, so
+the shader cache stays warm. Test
+`pipeline_workers_follow_the_setting_within_one_to_eight`.
+
+The same commit adds texture-refresh counters (diagnostics builds): why
+each texture was hashed (no guard, aliased, the guard saw a write, the
+eighth-frame turn, partly mapped), to cut the 110 ms a frame of texture
+hashing in #33, which found 0 MB changed.
+
 ## Next
 
-1. Test #33: same configuration with a warm shader cache (Test #32 filled
-   it), and present/target capture on, to separate the CPU cost of
-   translation from the frame and to check the picture with shared tiles.
-2. A shared-tiles off/on pair with capture, for the 579 MiB A/B and for
-   rendering correctness, before shared tiles go into `run-laptop.ps1`.
-3. Lighting: shadowed surfaces near black (ambient/indirect), open since
-   25 November; video memory over its budget late in the world.
+1. Test #36: #35 again (loop limit default, the cache now partly warm)
+   with `VICTORY_PIPELINE_WORKERS=2`, to answer the hair and skin
+   question.
+2. If the picture is still wrong: a run with `VICTORY_DUMP_TARGETS=1` on
+   one Lucia frame, to find the pass.
+3. A shared-tiles off/on pair with capture (the 579 MiB claim, and
+   correctness).
