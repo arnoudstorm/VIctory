@@ -645,8 +645,9 @@ fn room_to_compile() -> Option<MutexGuard<'static, ()>> {
 }
 
 /// Available physical RAM below which driver compiles go one at a time, as
-/// when commit room is short, in bytes: `VICTORY_COMPILE_MIN_AVAIL_MB` (1024
-/// unless set; 0 turns this part of the gate off). Commit room alone never
+/// when commit room is short, in bytes: `VICTORY_COMPILE_MIN_AVAIL_MB` (off
+/// unless set: game test 11 built no pipelines at all and still met the
+/// guard's floor, so compiles are not shown to be the pressure). Commit room alone never
 /// trips on a 16 GB laptop with a large page file (≈13 GB of commit room
 /// while available RAM fell to ≈200 MB in runs 5-10), so the gate also asks
 /// the RAM the driver's compile memory actually takes.
@@ -656,7 +657,7 @@ fn compile_min_avail() -> u64 {
         std::env::var("VICTORY_COMPILE_MIN_AVAIL_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1024)
+            .unwrap_or(0)
             << 20
     })
 }

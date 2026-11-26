@@ -270,8 +270,12 @@ impl Queue {
 }
 
 /// Available physical RAM below which the workers stop starting early
-/// (unrequested) pipelines, in bytes: `VICTORY_EARLY_MIN_AVAIL_MB` (2048
-/// unless set; 0 turns the pause off).
+/// (unrequested) pipelines, in bytes: `VICTORY_EARLY_MIN_AVAIL_MB` (off
+/// unless set). Game test 11 ran with 2048: early commitment was 0.7-0.9 GB
+/// lower for the first 25 s, but the run did not last longer, and 2,506
+/// early pipelines were still waiting at its end; in gameplay, where RAM is
+/// always short, the list would never run and new pipelines would be made
+/// only when a draw asks (dropped past the frame's budget). Opt-in.
 ///
 /// At start the workers make the whole early list (2,890 pipelines on the
 /// 780M laptop) on up to eight threads while the title loads; each one is a
@@ -286,7 +290,7 @@ fn early_min_avail() -> u64 {
 }
 
 fn early_min_avail_setting(mb: Option<&str>) -> u64 {
-    mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048) << 20
+    mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
 }
 
 /// Whether early pipelines may start with `available` bytes of physical RAM
@@ -497,10 +501,10 @@ mod tests {
 
     #[test]
     fn early_floor_setting_and_decision() {
-        assert_eq!(early_min_avail_setting(None), 2048 << 20);
+        assert_eq!(early_min_avail_setting(None), 0);
         assert_eq!(early_min_avail_setting(Some(" 0 ")), 0);
         assert_eq!(early_min_avail_setting(Some("1536")), 1536 << 20);
-        assert_eq!(early_min_avail_setting(Some("lots")), 2048 << 20);
+        assert_eq!(early_min_avail_setting(Some("lots")), 0);
         let floor = 2048 << 20;
         assert!(early_ok_with(Some(3 << 30), floor));
         assert!(!early_ok_with(Some(1 << 30), floor));
