@@ -25,11 +25,12 @@ pub(crate) fn start_allocation_sampler() {
                 let detached = crate::host::DETACHED_LISTS.load(Relaxed);
                 let lazy_opens = crate::host::LAZY_OPENED.load(Relaxed);
                 let rust_bytes: u64 = OWN[..4].iter().map(|v| v.load(Relaxed)).sum();
+                let rust_traffic = [RUST_LAYOUT_TRAFFIC[0].load(Relaxed),RUST_LAYOUT_TRAFFIC[1].load(Relaxed)];
                 let staging = crate::texture::staged_bytes_for_sampler();
                 let shadows = crate::shadow::live_copy_bytes_for_sampler();
                 let textures = crate::resource::HOST_TEXTURES[1].load(Relaxed);
                 let utc_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                if writeln!(file, "{{\"utc_ms\":{utc_ms},\"elapsed_ms\":{},\"private_bytes\":{private},\"working_set_bytes\":{working},\"available_bytes\":{available},\"commit_left_bytes\":{commit_left},\"rust_live_bytes\":{rust_bytes},\"staging_bytes\":{staging},\"shadow_copy_bytes\":{shadows},\"host_texture_bytes\":{textures},\"detached_lists\":{detached},\"lazy_opens_cumulative\":{lazy_opens},\"alive\":{alive:?},\"lists\":{lists:?}}}", began.elapsed().as_millis()).is_err() { return }
+                if writeln!(file, "{{\"utc_ms\":{utc_ms},\"elapsed_ms\":{},\"private_bytes\":{private},\"working_set_bytes\":{working},\"available_bytes\":{available},\"commit_left_bytes\":{commit_left},\"rust_live_bytes\":{rust_bytes},\"rust_layout_traffic_cumulative\":{rust_traffic:?},\"staging_bytes\":{staging},\"shadow_copy_bytes\":{shadows},\"host_texture_bytes\":{textures},\"detached_lists\":{detached},\"lazy_opens_cumulative\":{lazy_opens},\"alive\":{alive:?},\"lists\":{lists:?}}}", began.elapsed().as_millis()).is_err() { return }
                 if file.flush().is_err() { return }
                 std::thread::sleep(std::time::Duration::from_millis(allocation_sample_ms(available)));
             }
@@ -326,6 +327,9 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// some 2 MB a frame, and nothing said whose): this says which part is
 /// ours. Bigger blocks are allocations of their own in the map.
 static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Counted layout bytes allocated/freed, including old/new realloc layouts.
+/// These measure logical allocator traffic, not Windows commitment or copies.
+static RUST_LAYOUT_TRAFFIC: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The class of [`OWN`] a block of `size` bytes counts in.
 fn block_class(size: usize) -> usize {
@@ -338,6 +342,7 @@ fn block_class(size: usize) -> usize {
 }
 
 fn own(size: usize, made: bool) {
+    RUST_LAYOUT_TRAFFIC[usize::from(!made)].fetch_add(size as u64, Relaxed);
     let class = block_class(size);
     if made {
         OWN[class].fetch_add(size as u64, Relaxed);
@@ -346,6 +351,19 @@ fn own(size: usize, made: bool) {
         OWN[class].fetch_sub(size as u64, Relaxed);
         OWN[4 + class].fetch_sub(1, Relaxed);
     }
+}
+
+#[test]
+fn allocator_churn_remains_observable_after_live_blocks_are_freed() {
+    let allocated = RUST_LAYOUT_TRAFFIC[0].load(Relaxed);
+    let freed = RUST_LAYOUT_TRAFFIC[1].load(Relaxed);
+    let bytes = vec![0x59u8; 65536];
+    std::hint::black_box(&bytes);
+    drop(bytes);
+    // Other test/runtime threads can allocate too: test minimum coverage,
+    // without pretending these global deltas exclusively belong to us.
+    assert!(RUST_LAYOUT_TRAFFIC[0].load(Relaxed) - allocated >= 65536);
+    assert!(RUST_LAYOUT_TRAFFIC[1].load(Relaxed) - freed >= 65536);
 }
 
 /// Our own blocks of [`BIG`] bytes and more alive now: where each is (0:
