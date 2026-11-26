@@ -429,7 +429,11 @@ fn who_made_big(size: usize) {
         if frames.is_empty() {
             frames = trace.lines().map(str::trim).filter(|l| !l.starts_with("at ")).take(16).collect();
         }
-        tracing::info!(mb = size >> 20, frames = ?frames, "a block of 32 MB or more made");
+        // Return addresses as offsets into our executable, resolved offline
+        // against its PDB: in game test 11e the in-process lookup named only
+        // the system's thread-start frames.
+        let rvas = own_return_offsets();
+        tracing::info!(mb = size >> 20, frames = ?frames, rvas = ?rvas, "a block of 32 MB or more made");
     }
     INSIDE.with(|i| i.set(false));
 }
@@ -491,6 +495,34 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
 #[global_allocator]
 static HEAP: Counting = Counting;
+
+/// This thread's return addresses that lie in our own executable, as hex
+/// offsets from its base (at most 24, innermost first).
+fn own_return_offsets() -> Vec<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    let mut frames = [std::ptr::null_mut::<core::ffi::c_void>(); 48];
+    // SAFETY: a buffer of the length passed; no hash asked for.
+    let n = unsafe { RtlCaptureStackBackTrace(0, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    // SAFETY: the process's own executable stays loaded.
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+    if base == 0 {
+        return Vec::new();
+    }
+    // SAFETY: a loaded image starts with its DOS and NT headers.
+    let image = unsafe {
+        let nt = base + *((base + 0x3c) as *const u32) as usize;
+        // OptionalHeader.SizeOfImage: NT signature 4 + file header 20 + 56.
+        *((nt + 4 + 20 + 56) as *const u32) as usize
+    };
+    frames[..n]
+        .iter()
+        .map(|&f| f as usize)
+        .filter(|&f| f >= base && f < base + image)
+        .take(24)
+        .map(|f| format!("{:#x}", f - base))
+        .collect()
+}
 
 #[cfg(test)]
 mod command_tests {
