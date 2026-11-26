@@ -3379,7 +3379,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, mode: WindowLookup) -> Optio
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
         shadow.window = true;
-        shadow.tiles = Some(crate::tiles::Tiles::new(len as usize));
+        let tiles = crate::tiles::Tiles::new(len as usize);
+        shadow.tiles = Some(if crate::tiles::sharing() { tiles.of_title(start) } else { tiles });
         #[cfg(feature = "diagnostics")]
         shadow.trace_window_backing();
         let shadow = Arc::new(shadow);

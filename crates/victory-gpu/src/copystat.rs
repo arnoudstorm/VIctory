@@ -939,8 +939,10 @@ fn log_memory() {
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     if crate::tiles::on() {
         let (mapped, heaps, for_writes) = crate::tiles::line();
+        let shares = crate::tiles::SHARES.iter().map(|c| c.load(Relaxed) * crate::tiles::TILE as u64 >> 20).collect::<Vec<_>>();
         tracing::info!(
-            "memory, tiled windows: {mapped} MB of tiles mapped (memory held), in {heaps} MB of heaps; {for_writes} MB mapped for declared shader writes since the start; the windows' full size is in the line below"
+            "memory, tiled windows: {mapped} MB of tiles mapped (memory held), in {heaps} MB of heaps; {for_writes} MB mapped for declared shader writes since the start; shared tiles since the start: {} MB mapped onto another window's, {} MB made a window's own for shader writes; the windows' full size is in the line below",
+            shares[0], shares[1]
         );
     }
     tracing::info!(

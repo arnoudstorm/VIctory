@@ -15,6 +15,7 @@
 //! removed, measured), so a tiled window's CPU side is one address per
 //! tile, not one range: see `Shadow::read_at` and `Shadow::write_at`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -36,6 +37,42 @@ pub(crate) fn on() -> bool {
         on
     })
 }
+
+/// `VICTORY_SHARED_TILES=1` (with tiled windows; off by default): a window
+/// that maps a tile of title memory another window already holds a tile
+/// for maps the same tile of the pool, as long as no shader was declared to
+/// write it ([`Tiles::map_range`] gives a window its own tile then, with
+/// the bytes it had). Both windows are copies of the same title bytes, and
+/// every write into a tile outside a declared range is title bytes
+/// (`Shadow::copy`), so the windows see what each would have had, or
+/// newer. Measured in run 29: 579 MiB of tiles held the same title pages
+/// twice or more, 537 MiB of it a later, longer window (an ask without a
+/// length, to its 4 MiB cell's end) over pages shorter ones held.
+///
+/// No descriptor, list or recorded view changes: only which pool tile a
+/// window's tile is mapped onto, when it is first mapped (or, for a write,
+/// before the submission that declares it). A tile goes back to the pool
+/// when the last window holding it has been let go and every submission
+/// that ran meanwhile has finished.
+pub(crate) fn sharing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = on() && std::env::var_os("VICTORY_SHARED_TILES").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("windows over the same title memory share their tiles until shaders write them (VICTORY_SHARED_TILES=1)");
+        }
+        on
+    })
+}
+
+/// Shared tiles by title page (title address / [`TILE`]): the tile and how
+/// many windows hold it (holders let go but not yet past their
+/// submissions included). Only tiles no shader was declared to write.
+static SHARED: Mutex<Option<HashMap<u64, (Slot, u32)>>> = Mutex::new(None);
+
+/// Tiles a window mapped onto a tile another window held, and tiles given
+/// a window of its own because shaders write them, since the start.
+pub(crate) static SHARES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A heap of the pool: the heap, the placed buffer over it (kept alive
 /// while mapped), its CPU address, and its free tiles.
@@ -70,6 +107,9 @@ pub(crate) struct Slot {
     block: usize,
     tile: u32,
     pub(crate) cpu: usize,
+    /// The title page it is shared for ([`SHARED`]), 0 if it is the
+    /// window's own.
+    page: u64,
     #[cfg(feature = "diagnostics")]
     identity: u64,
 }
@@ -109,7 +149,7 @@ fn take() -> Option<(Slot, ID3D12Heap)> {
     unsafe { std::ptr::write_bytes(cpu as *mut u8, 0, TILE) };
     MAPPED.fetch_add(1, Ordering::Relaxed);
     Some((Slot {
-        block, tile, cpu,
+        block, tile, cpu, page: 0,
         #[cfg(feature = "diagnostics")]
         identity: b.identity * u64::from(PER_HEAP) + u64::from(tile),
     }, b.heap.clone()))
@@ -118,6 +158,38 @@ fn take() -> Option<(Slot, ID3D12Heap)> {
 /// Gives tiles back (only once nothing runs that uses them: see
 /// [`Tiles`]'s drop).
 fn give(slots: Vec<Slot>, _window: u64) {
+    // A shared tile goes back with its last holder. Lock order: a window's
+    // slots, then `SHARED`, then `POOL`.
+    let slots: Vec<Slot> = if slots.iter().any(|s| s.page != 0) {
+        let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .into_iter()
+            .filter(|s| {
+                if s.page == 0 {
+                    return true;
+                }
+                let Some(map) = shared.as_mut() else { return true };
+                match map.get_mut(&s.page) {
+                    Some((held, holders)) if held.block == s.block && held.tile == s.tile => {
+                        *holders -= 1;
+                        if *holders > 0 {
+                            return false;
+                        }
+                        map.remove(&s.page);
+                        true
+                    }
+                    // Made its last other holder's own meanwhile (`own`):
+                    // that holder frees it.
+                    _ => false,
+                }
+            })
+            .collect()
+    } else {
+        slots
+    };
+    if slots.is_empty() {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     for s in slots {
         if let Some(Some(b)) = pool.get_mut(s.block) {
@@ -144,6 +216,12 @@ fn give(slots: Vec<Slot>, _window: u64) {
         pool[i] = None;
         HEAPS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// The heap a slot's tile is in.
+fn heap_of(slot: &Slot) -> Option<ID3D12Heap> {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.get(slot.block)?.as_ref().map(|b| b.heap.clone())
 }
 
 fn make_block() -> Option<Block> {
@@ -227,6 +305,12 @@ pub(crate) fn reserved(size: u64) -> Option<ID3D12Resource> {
 pub(crate) struct Tiles {
     at: Box<[AtomicUsize]>,
     slots: Mutex<Vec<Slot>>,
+    /// The title page of the window's first tile, when its tiles may be
+    /// shared ([`sharing`]); 0 otherwise.
+    first_page: u64,
+    /// Slots held that are shared ([`Slot::page`]), so that a write
+    /// declared on a window with none costs no search.
+    shared: AtomicUsize,
     #[cfg(feature = "diagnostics")]
     window: u64,
 }
@@ -239,9 +323,20 @@ impl Tiles {
         Tiles {
             at: (0..len.div_ceil(TILE)).map(|_| AtomicUsize::new(0)).collect(),
             slots: Mutex::default(),
+            first_page: 0,
+            shared: AtomicUsize::new(0),
             #[cfg(feature = "diagnostics")]
             window: 0,
         }
+    }
+
+    /// The window is of title memory from `start` (on the tile grid): its
+    /// tiles may be shared with other windows' (callers check [`sharing`]).
+    pub(crate) fn of_title(mut self, start: u64) -> Tiles {
+        if start % TILE as u64 == 0 && start != 0 {
+            self.first_page = start / TILE as u64;
+        }
+        self
     }
 
     #[cfg(feature = "diagnostics")]
@@ -293,11 +388,10 @@ impl Tiles {
         if cpu != 0 {
             return (cpu + off % TILE) as *mut u8;
         }
-        let Some((taken, heap)) = take() else {
+        let Some(host) = crate::host::host() else {
             return std::ptr::null_mut();
         };
-        let Some(host) = crate::host::host() else {
-            give(vec![taken], 0);
+        let Some((taken, heap)) = self.share_or_take(i) else {
             return std::ptr::null_mut();
         };
         host.map_tile(buffer, i as u32, &heap, taken.tile);
@@ -310,15 +404,90 @@ impl Tiles {
         (taken.cpu + off % TILE) as *mut u8
     }
 
-    /// Maps every tile of offsets `[from, to)` (shaders write there).
+    /// Tile `i`: the tile another window holds for the same title page if
+    /// there is one ([`sharing`]), else a new one (shared from now on if
+    /// the window's tiles may be). Called under the window's slots lock.
+    fn share_or_take(&self, i: usize) -> Option<(Slot, ID3D12Heap)> {
+        if self.first_page == 0 {
+            return take();
+        }
+        let page = self.first_page + i as u64;
+        let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        let map = shared.get_or_insert_with(HashMap::new);
+        if let Some((held, holders)) = map.get_mut(&page)
+            && let Some(heap) = heap_of(held)
+        {
+            *holders += 1;
+            SHARES[0].fetch_add(1, Ordering::Relaxed);
+            self.shared.fetch_add(1, Ordering::Relaxed);
+            return Some((*held, heap));
+        }
+        let (mut taken, heap) = take()?;
+        taken.page = page;
+        map.insert(page, (taken, 1));
+        self.shared.fetch_add(1, Ordering::Relaxed);
+        Some((taken, heap))
+    }
+
+    /// Maps every tile of offsets `[from, to)` (shaders write there), each
+    /// the window's own: a shared tile is copied to one of its own first
+    /// ([`sharing`]), mapped on the queue ahead of the submission that
+    /// writes it; the shared one goes when the submissions that ran with it
+    /// have finished.
     pub(crate) fn map_range(&self, buffer: &ID3D12Resource, from: usize, to: usize) {
         let before = self.mapped();
         let mut at = from - from % TILE;
         while at < to {
             self.write_at(buffer, at);
+            if self.shared.load(Ordering::Relaxed) != 0 {
+                self.own(buffer, at / TILE);
+            }
             at += TILE;
         }
         BY[0].fetch_add((self.mapped() - before) as u64, Ordering::Relaxed);
+    }
+
+    /// Makes tile `i` (mapped) the window's own.
+    fn own(&self, buffer: &ID3D12Resource, i: usize) {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cpu) = self.at.get(i).map(|a| a.load(Ordering::Acquire)) else { return };
+        let Some(k) = slots.iter().position(|s| s.cpu == cpu && s.page != 0) else {
+            return;
+        };
+        let old = slots[k];
+        let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = shared.as_mut() else { return };
+        let alone = matches!(map.get(&old.page), Some((held, 1)) if held.block == old.block && held.tile == old.tile);
+        if alone {
+            // No other window holds it: it is this one's, and no window
+            // joins it from now on.
+            map.remove(&old.page);
+            slots[k].page = 0;
+            self.shared.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        drop(shared);
+        let (Some(host), Some((mut mine, heap))) = (crate::host::host(), take()) else {
+            // No tile to be had: the writes go to the shared one, as one
+            // window's tile would have held them.
+            return;
+        };
+        // SAFETY: two distinct pool tiles, each `TILE` bytes, mapped.
+        unsafe { std::ptr::copy_nonoverlapping(old.cpu as *const u8, mine.cpu as *mut u8, TILE) };
+        mine.page = 0;
+        host.map_tile(buffer, i as u32, &heap, mine.tile);
+        #[cfg(feature = "diagnostics")]
+        if self.window != 0 {
+            crate::allocation_telemetry::note("window_tile_bind", self.window, i as u64, mine.identity);
+        }
+        slots[k] = mine;
+        self.at[i].store(mine.cpu, Ordering::Release);
+        self.shared.fetch_sub(1, Ordering::Relaxed);
+        SHARES[1].fetch_add(1, Ordering::Relaxed);
+        // Submissions running now may read the shared tile through this
+        // window: its hold ends after them.
+        drop(slots);
+        crate::host::retire(Back(vec![old], 0));
     }
 
     /// Tiles mapped in this window.
@@ -408,6 +577,54 @@ mod tests {
         assert!(out[..TILE - 100].iter().all(|&b| b == 0), "unmapped or unwritten bytes read 0");
         assert!(out[TILE - 100..2 * TILE + 100].iter().all(|&b| b == 0x5a), "the card sees the CPU's writes");
         assert!(out[2 * TILE + 100..].iter().all(|&b| b == 0), "the rest reads 0");
+        assert!(host.device_alive());
+    }
+
+    /// Two windows over the same title pages (a short one and a longer one
+    /// holding it, as an ask without a length makes): the longer maps the
+    /// short one's tile, and the card reads the bytes through both. A write
+    /// declared on the longer gives it its own tile with the same bytes,
+    /// after which neither sees the other's CPU writes. Once both are let
+    /// go nothing is left shared for their pages.
+    #[test]
+    fn windows_over_the_same_title_pages_share_tiles_until_shaders_write() {
+        let Some(host) = crate::host::host() else { return };
+        // A title address no other test uses.
+        const BASE: u64 = 0x7a_1230_0000;
+        let (Some(short_buffer), Some(long_buffer)) = (reserved(4 * TILE as u64), reserved(16 * TILE as u64)) else { return };
+        let short = Tiles::new(4 * TILE).of_title(BASE + 4 * TILE as u64);
+        let long = Tiles::new(16 * TILE).of_title(BASE);
+        // The short window's tile 1 is title page 5, the long one's tile 5.
+        let at = short.write_at(&short_buffer, TILE);
+        assert!(!at.is_null());
+        // SAFETY: a mapped tile, TILE bytes.
+        unsafe { std::ptr::write_bytes(at, 0x5a, TILE) };
+        let shared = long.write_at(&long_buffer, 5 * TILE);
+        assert_eq!(shared, at, "the longer window maps the tile the shorter one holds");
+        assert_eq!(SHARED.lock().unwrap().as_ref().unwrap()[&(BASE / TILE as u64 + 5)].1, 2);
+        let out = host.copy_out_for_test(&long_buffer, 5 * TILE as u64, TILE as u64).expect("read back");
+        assert!(out.iter().all(|&b| b == 0x5a), "the card reads the shared tile through the longer window");
+        // A write declared on the longer window: a tile of its own, same bytes.
+        long.map_range(&long_buffer, 5 * TILE + 10, 5 * TILE + 20);
+        let own = long.write_at(&long_buffer, 5 * TILE);
+        assert_ne!(own, at, "a tile shaders write is the window's own");
+        // SAFETY: the shorter window's tile, still mapped.
+        unsafe { std::ptr::write_bytes(at, 0x11, TILE) };
+        let long_out = host.copy_out_for_test(&long_buffer, 5 * TILE as u64, TILE as u64).expect("read back");
+        let short_out = host.copy_out_for_test(&short_buffer, TILE as u64, TILE as u64).expect("read back");
+        assert!(long_out.iter().all(|&b| b == 0x5a), "the copy kept the bytes it had");
+        assert!(short_out.iter().all(|&b| b == 0x11), "the shorter window still has its tile");
+        // A tile only one window holds, written: made its own in place.
+        let lone = long.write_at(&long_buffer, 12 * TILE);
+        long.map_range(&long_buffer, 12 * TILE, 12 * TILE + 4);
+        assert_eq!(long.write_at(&long_buffer, 12 * TILE), lone);
+        assert!(!SHARED.lock().unwrap().as_ref().unwrap().contains_key(&(BASE / TILE as u64 + 12)));
+        drop(short);
+        drop(long);
+        let left = SHARED.lock().unwrap().as_ref().map_or(0, |map| {
+            map.keys().filter(|&&page| (BASE / TILE as u64..BASE / TILE as u64 + 16).contains(&page)).count()
+        });
+        assert_eq!(left, 0, "nothing stays shared once both windows are let go");
         assert!(host.device_alive());
     }
 }
