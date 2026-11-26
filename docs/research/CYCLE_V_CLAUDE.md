@@ -322,6 +322,8 @@ with it before it can be a default.
 | #36 | `2ded7c88`, 2 pipeline workers | stopped by hand, 8.8 min | world: HUD and tip, 3D black (pipelines) | — |
 | #37 | `be1ca828`, alias guard, 8 workers, 20 min cap | **panic** at 24 s (our counter overflow, fixed) | start screen (1 draw) | — |
 | #38 | `924e2679`, **plain** lowmem preset (none of the new switches, no compile gate, no capture or tracing) | **process vanished** at 6.1 min, exit code 0, no record | world 3D from 4.6 min, 85 s of it | 1.60 |
+| #39 | `924e2679`, everything on: shared tiles, alias guard, 8 workers, compile gate, capture, tracing; loop limit 32 | stopped by hand at the 15-min mark | world from 4.5 min, 10.5 min of it; black blocks in the sky, Lucia's hair streaks and black skin | 1.10 (median) |
+| #40 | `2e6645ec`, #39's switches with the loop limit at the default 2^20, cache prewarmed (`victory prewarm-shaders`) | **process vanished** at 7.8 min, exit code 0, no record | world from 4.7 min, 3.1 min of it; sky right (no black blocks); Lucia not on screen | 0.60 (median) |
 
 ## Test #37 (`be1ca828`): the runtime panicked at 24 s
 
@@ -414,7 +416,51 @@ and the counter fix are not switches. The launcher's
 `CLAUDE_SHADER_LOOP_LIMIT` override is outside the repository
 (`work/run-laptop-card256.ps1`, original kept as `.bak-claude-t35`).
 
-## Next
+## Tests #39 and #40
+
+Same settings but the loop limit (32 in #39, the default 2^20 in #40) and
+the build (`924e2679`, `2e6645ec` with the prewarm tool; the runtime is
+the same). Emergency watchdog on (observation of single dips, stop on
+sustained floors and the manual stop file). Figures from `process.jsonl`,
+world samples only (3,000 draws or more; that includes black world
+frames), each sample a 5 s average:
+
+| | #39 (loop limit 32) | #40 (default limit, prewarmed) |
+|---|---|---|
+| World from | 272 s | 284 s |
+| World time | 627 s | 187 s |
+| fps median / mean / peak | 1.10 / 1.05 / 1.40 | 0.60 / 0.57 / 0.70 |
+| Sample frame time p50 / p90 / p99 | 894 / 1,502 / 2,268 ms | 1,674 / 2,167 / 4,642 ms |
+| CPU per frame (median) | 792 ms | 1,504 ms |
+| Texture refreshes, CPU per frame (last 60 lines) | 863 ms | 1,282 ms |
+| Peak private bytes | 13.56 GiB | 13.22 GiB |
+| Lowest available RAM | 0 MiB (dips under 2 s) | 1 MiB (dips under 2 s) |
+| Shader cache | warm for limit 32 | 742 hits, 36 misses (the prewarm's keys match) |
+| End | manual stop file at 901 s | the process ended itself, exit code 0, at 470 s |
+
+- **Sky.** #39's frames had black rectangular blocks in the sky; #40's
+  sky is bright and continuous at the same spawn point. The loop limit
+  of 32 cutting the volumetric ray-march short fits; one pair, so
+  **observed, not proven**.
+- **Hair and skin.** Not answered: Lucia was not on screen before #40
+  ended.
+- **Still wrong in #40.** Parked cars with black blotches; a pixel-noise
+  pattern on building fronts.
+- **The slowdown.** #34 (1.90 fps), #36 and #38 spent 54-101 ms a frame
+  refreshing textures; #39 and #40, the only runs with
+  `VICTORY_ALIAS_GUARD=1`, spent 863 and 1,282 ms. The guard cut hashed
+  bytes (130 MB a frame in #36 to 20-45 MB) but the refreshes as a whole
+  grew 10-20 times. The association is strong, the cause is not shown;
+  Cycle VI's first A/B (#41 without, #42 with) settles it.
+- **The silent exits.** #38 (no capture) and #40 ended with exit code 0
+  and no record; #39, with capture, ran 15 minutes. So the capture is not
+  what ends them. Low RAM just before (0-1 MiB dips) and the title's own
+  watchdog (`VICTORY_NO_WATCHDOG`, on `fix/prestream-1118` only) are the
+  candidates.
+
+The analysis goes on in `CYCLE_VI_CROSS_FORK.md`.
+
+## Next (as planned before #38; carried out in #38-#40, superseded by Cycle VI)
 
 1. The next run (#38, when launches resume): #37's settings with the
    fixed build. Loop limit default (cache partly warm), 8 workers,
