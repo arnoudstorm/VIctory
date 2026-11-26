@@ -118,3 +118,15 @@ Prior37.042-49.567 s burst was not covered completely: last allocation sample37.
 Full report/logs outside repo: outputs/run5-20261126-150044/run5-report.md. Native/VM stacks and region/event identity match evidence: region-event-stack-correlation.json; correlator output terminal-correlation.json. Report includes all ten requested sections, metrics, provenance, log index, preservation limits and targeted engineering proposals.
 
 Next development priorities, no automatic relaunch: batch/coalesce high-volume physical-map/commit diagnostic traffic while prioritizing coarse VM events; validate loss/tail accounting. Tag Rust allocation traffic by DirectStorage/decode/shader/scratch owner before bounded buffer reuse. Investigate matching174 MiB regions by resource identity, not size alone. Do not alter title arena semantics, enable descriptor cleanup, repeat E17, or combine refresh A/B until safe startup/input exist. Keep game closed until another controlled test is authorized.
+
+## E30 current next steps — supersedes older launch queues
+
+Run #6 consumed the authorized launch and ended on the memory guard at72.711s. Do not restart automatically. Await another controlled-test authorization. Current experimental runtime sourceff3d88a7399dde2ede1ade64edd8b5e7b1ef1463; final external release/diagnostic candidates and hashes in phase6-final-build-provenance.json. Release identical to f69d42f Run6; final logger correction affects diagnostics only. Baselines preserved, laptop/780m unchanged.
+
+1. Before another test, save work and manually confirm idle optional apps. Fresh privateWS:Discord430.8MiB,Claude173.4,Steam90.3,Epic25.0,Teams25.2. Combined744.7MiB is accounting/planning only; hypothesized0.25-0.5GiB physical recovery is unmeasured. Keep Codex/security/drivers/services; no auto closures.
+2. Use corrected coarse VM logger with5s region interval in a separately labeled diagnostic run, not all expensive diagnostics together. Correlate complete37-55s snapshots, title VM flags/callers and CPU mapped address allocation bases. Four large title arenas remain semantically unchanged; burst remainder not assigned to driver.
+3. Add bounded low-frequency DirectStorage per-role allocation/retained/high-water counters and sum texture scratch lifetimes before capacity policy. Pool reuse synthetic savings are allocation traffic only, defaultoff; memory footprint can rise16MiB.
+4. Investigate texture refresh/remap lock duration using synthetic concurrent mapping/replacement/stable-read tests. Do not remove guard or repeat E17 window merging.
+5. Resume actual input/movement/world verification first, then matched release reuse0/1 or refresh1/16, one flag per A/B, same caches/settings/power/route and100ms safety. Need per-present timings for percentiles. Previous5:40gameplay record unchanged; Run6gameplay0.
+
+Exact next-run preview and guarded launch instructions are outside repo in outputs/phase6-next-test.ps1 (default preview only; -Run only after next authorization). Full findings/limitations: outputs/phase6-development-and-run6.md. No further gameplay milestone claimed.
