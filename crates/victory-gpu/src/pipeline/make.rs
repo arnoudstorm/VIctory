@@ -247,8 +247,14 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
+    /// The next pipeline to make: requested ones first, then early ones
+    /// unless `early_ok` is false (physical memory is short, see
+    /// [`early_allowed`]); those stay queued and a draw can still promote them.
+    fn pop(&mut self, early_ok: bool) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
+            if !early_ok {
+                return None;
+            }
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
@@ -256,7 +262,54 @@ impl Queue {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
+
+    /// Whether early entries that are still unclaimed wait in the queue.
+    fn early_waiting(&self) -> bool {
+        self.early.iter().any(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+    }
 }
+
+/// Available physical RAM below which the workers stop starting early
+/// (unrequested) pipelines, in bytes: `VICTORY_EARLY_MIN_AVAIL_MB` (2048
+/// unless set; 0 turns the pause off).
+///
+/// At start the workers make the whole early list (2,890 pipelines on the
+/// 780M laptop) on up to eight threads while the title loads; each one is a
+/// translation plus a driver compile or library load, whose native memory
+/// comes and goes in waves of hundreds of MB. On a 16 GB shared-memory
+/// laptop those waves met the title's own loading, and in runs 5-10 available
+/// RAM reached the external guard's floor during startup. Requested pipelines
+/// (a draw or dispatch is waiting) are never held back by this.
+fn early_min_avail() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| early_min_avail_setting(std::env::var("VICTORY_EARLY_MIN_AVAIL_MB").ok().as_deref()))
+}
+
+fn early_min_avail_setting(mb: Option<&str>) -> u64 {
+    mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048) << 20
+}
+
+/// Whether early pipelines may start with `available` bytes of physical RAM
+/// (`None`: Windows did not say) under a floor of `floor` bytes (0: no floor).
+fn early_ok_with(available: Option<u64>, floor: u64) -> bool {
+    floor == 0 || available.is_none_or(|a| a >= floor)
+}
+
+fn early_allowed() -> bool {
+    let floor = early_min_avail();
+    if floor == 0 {
+        return true;
+    }
+    #[cfg(windows)]
+    let available = crate::host::available_physical_ram();
+    #[cfg(not(windows))]
+    let available: Option<u64> = None;
+    early_ok_with(available, floor)
+}
+
+/// Times a worker found only early work while physical RAM was short, and
+/// the milliseconds it then waited.
+pub(crate) static EARLY_PAUSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
@@ -283,12 +336,30 @@ fn start(p: &Arc<Pending>, priority: u8) {
 }
 
 fn next() -> Arc<Pending> {
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        // Asked outside the queue's lock: a system call.
+        let early_ok = early_allowed();
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = queue.pop(early_ok) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        if !early_ok && queue.early_waiting() {
+            // Look again soon: memory comes back, or a draw promotes one.
+            let began = Instant::now();
+            let _ = AVAILABLE.wait_timeout(queue, Duration::from_millis(250));
+            let paused = EARLY_PAUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let ms = EARLY_PAUSED[1].fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if paused.is_power_of_two() && paused >= 4 {
+                tracing::info!(
+                    paused,
+                    waited_ms = ms,
+                    floor_mb = early_min_avail() >> 20,
+                    "early pipelines paused: available physical RAM is short (VICTORY_EARLY_MIN_AVAIL_MB)"
+                );
+            }
+            continue;
+        }
+        drop(AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -390,10 +461,50 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &earlier));
+        assert!(queue.pop(true).is_none());
+    }
+
+    /// While physical memory is short, requested pipelines are still made,
+    /// early ones wait in the queue, and a draw can promote a waiting one.
+    #[test]
+    fn short_memory_holds_back_only_early_pipelines() {
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let later = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.push(&early, EARLY);
+        queue.push(&later, EARLY);
+        queue.push(&requested, REQUESTED);
+
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(queue.pop(false).is_none());
+        assert!(queue.early_waiting());
+
+        // A draw asks for `later`: it is made although memory is short.
+        assert_eq!(queue.push(&later, REQUESTED), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &later));
+        assert!(queue.pop(false).is_none());
+
+        // Memory came back: the rest of the early list goes on.
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &early));
+        assert!(!queue.early_waiting());
+        assert!(queue.pop(true).is_none());
+    }
+
+    #[test]
+    fn early_floor_setting_and_decision() {
+        assert_eq!(early_min_avail_setting(None), 2048 << 20);
+        assert_eq!(early_min_avail_setting(Some(" 0 ")), 0);
+        assert_eq!(early_min_avail_setting(Some("1536")), 1536 << 20);
+        assert_eq!(early_min_avail_setting(Some("lots")), 2048 << 20);
+        let floor = 2048 << 20;
+        assert!(early_ok_with(Some(3 << 30), floor));
+        assert!(!early_ok_with(Some(1 << 30), floor));
+        assert!(early_ok_with(None, floor), "unknown memory never stops the list");
+        assert!(early_ok_with(Some(0), 0), "a floor of 0 turns the pause off");
     }
 }
