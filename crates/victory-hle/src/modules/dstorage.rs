@@ -89,6 +89,17 @@ impl Drop for WorkBuffer {fn drop(&mut self){
 }}
 enum Source { Borrowed(&'static [u8]), Owned(WorkBuffer) }
 impl std::ops::Deref for Source {type Target=[u8];fn deref(&self)->&[u8]{match self{Self::Borrowed(b)=>b,Self::Owned(b)=>b}}}
+impl AsRef<[u8]> for Source{fn as_ref(&self)->&[u8]{self}}
+
+/// Consumes the compressed input, so it is released before the caller
+/// allocates another destination or retries physical writes. A shadowed
+/// local in the caller would otherwise keep its allocation until return.
+fn inflated_source(source:impl AsRef<[u8]>,size:usize)->Result<Source,HRESULT>{
+    let mut packed=WorkBuffer::new(size,1);
+    let n=inflate(source.as_ref(),&mut packed)?;
+    packed.0.truncate(n);
+    Ok(Source::Owned(packed))
+}
 
 /// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
@@ -880,14 +891,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = WorkBuffer::new(request.intermediate_size as usize,1);
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.0.truncate(n);
-        Source::Owned(packed)
+        inflated_source(source,request.intermediate_size as usize).map_err(|hr|fail(hr,"zlib"))?
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    // The consumed callback releases its input before physical copy retries.
+    into_destination(request, size, move |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -1309,6 +1318,59 @@ mod tests {
             zlib_rs::compress_slice(&mut buf, plain, zlib_rs::DeflateConfig::new(6));
         assert_eq!(rc, zlib_rs::ReturnCode::Ok);
         packed.to_vec()
+    }
+
+    #[test]
+    fn inflate_consumes_input_before_destination_work_including_errors(){
+        struct Input(Vec<u8>,std::sync::Arc<AtomicBool>);
+        impl AsRef<[u8]> for Input{fn as_ref(&self)->&[u8]{&self.0}}
+        impl Drop for Input{fn drop(&mut self){self.1.store(true,Ordering::SeqCst);}}
+        let baseline_freed=std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let input=Input(compress_zlib(b"old scope"),baseline_freed.clone());
+            let mut output=WorkBuffer::new(128,1);
+            inflate(input.as_ref(),&mut output).unwrap();
+            assert!(!baseline_freed.load(Ordering::SeqCst),"old scope retains input after inflation");
+        }
+        assert!(baseline_freed.load(Ordering::SeqCst));
+        for broken in [false,true]{
+            let freed=std::sync::Arc::new(AtomicBool::new(false));
+            let input=Input(if broken{vec![0;31]}else{compress_zlib(b"original synthetic allocation lifetime")},freed.clone());
+            let result=inflated_source(input,128);
+            assert!(freed.load(Ordering::SeqCst),"source must be gone before destination work");
+            if broken{assert!(result.is_err());}else{assert_eq!(&*result.unwrap(),b"original synthetic allocation lifetime");}
+        }
+    }
+    #[test]
+    #[ignore="optimized lifetime/capacity benchmark; run with VICTORY_DSTORAGE_REUSE=0"]
+    fn consumed_decode_input_capacity_benchmark(){
+        assert!(!reuse_buffers());
+        let mut state=7u32;
+        let plain:Vec<u8>=(0..1<<20).map(|_|{state^=state<<13;state^=state>>17;state^=state<<5;state as u8}).collect();
+        let compressed=compress_zlib(&plain);
+        for trial in 0..3{
+            for early in if trial%2==0{[false,true]}else{[true,false]}{
+                let began=Instant::now();let mut peak=0;
+                for _ in 0..32{
+                    let mut input=WorkBuffer::new(compressed.len(),0);input.copy_from_slice(&compressed);
+                    let input_cap=input.0.capacity();
+                    if early{
+                        let output=inflated_source(Source::Owned(input),plain.len()).unwrap();
+                        let Source::Owned(ref out)=output else{unreachable!()};
+                        let mut destination=WorkBuffer::new(plain.len(),2);destination.copy_from_slice(&output);
+                        peak=peak.max((input_cap+out.0.capacity()).max(out.0.capacity()+destination.0.capacity()));
+                        assert_eq!(&*destination,&plain);
+                    }else{
+                        let input=Source::Owned(input);let mut output=WorkBuffer::new(plain.len(),1);
+                        assert_eq!(inflate(&input,&mut output).unwrap(),plain.len());
+                        let mut destination=WorkBuffer::new(plain.len(),2);destination.copy_from_slice(&output);
+                        peak=peak.max(input_cap+output.0.capacity()+destination.0.capacity());
+                        assert_eq!(&*destination,&plain);
+                    }
+                }
+                eprintln!("decode lifetime trial={trial} early={early} us={} peak_owned_capacity={peak} requests=32",began.elapsed().as_micros());
+            }
+        }
     }
 
     #[test]
