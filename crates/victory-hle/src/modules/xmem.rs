@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -369,9 +369,71 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // Its committed pages go with it (no view of it is left: views
+        // hold slices, and slices the section).
+        committed_pages().forget(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+/// The section pages committed so far ([`commit`]), once per page however
+/// many views show it: what the title's physical pages charge, for the
+/// status line (`victory_gpu::title_pages_committed`).
+#[derive(Default)]
+struct CommittedPages {
+    by_section: HashMap<usize, HashSet<usize>>,
+    pages: usize,
+}
+
+impl CommittedPages {
+    /// Pages `first..first + n` of `section` are committed: how many of
+    /// them were not before.
+    fn add(&mut self, section: usize, first: usize, n: usize) -> usize {
+        let set = self.by_section.entry(section).or_default();
+        let new = (first..first + n).filter(|&i| set.insert(i)).count();
+        self.pages += new;
+        new
+    }
+
+    /// `section` is closed: its pages are no longer charged.
+    fn forget(&mut self, section: usize) {
+        if let Some(set) = self.by_section.remove(&section) {
+            self.pages -= set.len();
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.pages * PAGE) as u64
+    }
+}
+
+static COMMITTED_PAGES: LazyLock<Mutex<CommittedPages>> = LazyLock::new(Mutex::default);
+
+/// The counted pages; told to the GPU side's status line when dropped.
+struct Counted(MutexGuard<'static, CommittedPages>);
+
+impl std::ops::Deref for Counted {
+    type Target = CommittedPages;
+    fn deref(&self) -> &CommittedPages {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Counted {
+    fn deref_mut(&mut self) -> &mut CommittedPages {
+        &mut self.0
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        victory_gpu::title_pages_committed(self.0.bytes());
+    }
+}
+
+fn committed_pages() -> Counted {
+    Counted(COMMITTED_PAGES.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -514,7 +576,7 @@ impl View {
         #[cfg(feature = "diagnostics")]
         crate::memory_events::record_mapping("XMemPhysical/transient-map",at.Value as usize,len,slice.section.0 as usize,offset);
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -792,7 +854,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, &slice) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -809,8 +871,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
+/// Commits the section pages a view shows (once per page, whichever view):
+/// `[base, base + len)`, which shows `slice` and the slices after it.
+fn commit(base: usize, len: usize, slice: &Slice) -> bool {
     if pool_committed() {
         return true; // the section is committed whole
     }
@@ -819,6 +882,7 @@ fn commit(base: usize, len: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     crate::memory_events::record("XMemPhysical/commit", base, len, MEM_COMMIT, committed as usize, 0);
     if !committed.is_null() {
+        committed_pages().add(slice.section.0 as usize, slice.index, len.div_ceil(PAGE));
         return true;
     }
     let error = std::io::Error::last_os_error();
@@ -1112,6 +1176,21 @@ mod tests {
         assert_eq!(size_of::<WorkingSet>(), 0x50);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
+    }
+
+    /// A page shown by two views is counted once, and a closed section's
+    /// pages are no longer counted.
+    #[test]
+    fn committed_pages_are_counted_once_per_section_page() {
+        let mut c = super::CommittedPages::default();
+        assert_eq!(c.add(1, 0, 4), 4);
+        assert_eq!(c.add(1, 2, 4), 2);
+        assert_eq!(c.add(2, 0, 1), 1);
+        assert_eq!(c.bytes(), 7 * super::PAGE as u64);
+        c.forget(1);
+        assert_eq!(c.bytes(), super::PAGE as u64);
+        c.forget(9);
+        assert_eq!(c.bytes(), super::PAGE as u64);
     }
 
     #[test]

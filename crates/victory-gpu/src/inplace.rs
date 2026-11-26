@@ -582,6 +582,15 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
+/// The title's physical pages committed so far, in bytes (told by the
+/// HLE side whenever the count changes), for the status line.
+pub(crate) static TITLE_PAGES_COMMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The title's physical pages now committed: `bytes`, once per page.
+pub fn title_pages_committed(bytes: u64) {
+    TITLE_PAGES_COMMITTED.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);

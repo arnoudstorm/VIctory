@@ -3621,12 +3621,13 @@ mod telemetry_tests {
             texture_failures: 7,
             pipelines_loaded: 900,
             pipelines_made: 1200,
+            title_pages_mb: 2048,
         };
         assert_eq!(
             t.caption(),
             " | VIctory 0.8 fps 1194.7 ms (CPU 616.9, GPU wait 398.9) 3351 draws | RAM 6735 MB | \
              VRAM 6957/6001 MB, shared 120 MB | buffers 1143 shared, 42 upload | texture failures 7 | \
-             pipelines 900 cached, 1200 built"
+             pipelines 900 cached, 1200 built | title pages 2048 MB"
         );
     }
 
@@ -7647,6 +7648,8 @@ pub(crate) struct Telemetry {
     /// Pipelines loaded from the library and made by the driver.
     pipelines_loaded: u64,
     pipelines_made: u64,
+    /// The title's physical pages committed, in MiB.
+    title_pages_mb: u64,
 }
 
 impl Telemetry {
@@ -7666,6 +7669,7 @@ impl Telemetry {
             texture_failures: crate::resource::TEXTURE_FAILURES.load(Ordering::Relaxed),
             pipelines_loaded: crate::pipeline::library::LOADED.load(Ordering::Relaxed),
             pipelines_made: crate::pipeline::library::MADE.load(Ordering::Relaxed),
+            title_pages_mb: crate::inplace::TITLE_PAGES_COMMITTED.load(Ordering::Relaxed) >> 20,
         }
     }
 
@@ -7677,7 +7681,7 @@ impl Telemetry {
         };
         format!(
             " | VIctory {:.1} fps {:.1} ms (CPU {:.1}, GPU wait {:.1}) {:.0} draws | RAM {} MB | {vram} | \
-             buffers {} shared, {} upload | texture failures {} | pipelines {} cached, {} built",
+             buffers {} shared, {} upload | texture failures {} | pipelines {} cached, {} built | title pages {} MB",
             self.fps,
             self.ms,
             self.cpu_ms,
@@ -7688,7 +7692,8 @@ impl Telemetry {
             self.upload_buffers,
             self.texture_failures,
             self.pipelines_loaded,
-            self.pipelines_made
+            self.pipelines_made,
+            self.title_pages_mb
         )
     }
 }
