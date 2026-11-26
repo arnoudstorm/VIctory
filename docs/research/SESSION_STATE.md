@@ -187,3 +187,7 @@ Three matched synthetic pairs held the same 32 MiB of logical overlap and reduce
 ## Cycle V final state
 
 Test #29 reached partial world preparation and ended on the emergency watchdog at 178.705 s. Test #30 was held after the 4.824 MiB minimum and zero eligible geometry requests. See [Cycle V final handover](CYCLE_V_HANDOVER.md) for exact build provenance, attribution, and hardware testing.
+
+## Claude continuation
+
+Shared tiles (`4e9052e7`, opt-in) and Test #30: see [Cycle V, continued](CYCLE_V_CLAUDE.md).
