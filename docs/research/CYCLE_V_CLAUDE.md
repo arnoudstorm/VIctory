@@ -321,6 +321,7 @@ with it before it can be a default.
 | #35 | loop limit default (cold cache) | emergency stop, ~4.4 min | world's first frame, then black (shaders) | — |
 | #36 | `2ded7c88`, 2 pipeline workers | stopped by hand, 8.8 min | world: HUD and tip, 3D black (pipelines) | — |
 | #37 | `be1ca828`, alias guard, 8 workers, 20 min cap | **panic** at 24 s (our counter overflow, fixed) | start screen (1 draw) | — |
+| #38 | `924e2679`, **plain** lowmem preset (none of the new switches, no compile gate, no capture or tracing) | **process vanished** at 6.1 min, exit code 0, no record | world 3D from 4.6 min, 85 s of it | 1.60 |
 
 ## Test #37 (`be1ca828`): the runtime panicked at 24 s
 
@@ -341,7 +342,35 @@ mapped until the test process ends: the write journal keeps its pages for
 good, and the next test given those addresses found them written (two
 watch tests failed on the first suite run with the fix).
 
-## Audit of Tests #30-#37
+## Test #38 (`924e2679`, plain)
+
+The lowmem preset alone: no `VICTORY_SHARED_TILES`, `VICTORY_ALIAS_GUARD`,
+`VICTORY_PIPELINE_WORKERS`, compile gate, capture or extra tracing; loop
+limit 32 (its shaders all cached). Emergency watchdog on, cap 900 s.
+
+| | |
+|---|---|
+| World, 3D drawn | from 4.6 min (277 s; #34: 85 s with tracing) to 6.0 min |
+| Heavy world frames (n=59, ~6,760 draws) | 1.60 fps; p50 638 ms, p90 910 ms; CPU 376 ms, GPU wait 201 ms |
+| RAM / VRAM in the world | 13.0 GB / 6,252 of 6,543 MB |
+| Dips at or below 64 MiB | 6 in 14 s (274-288 s), three at 0 MiB for 0.4-0.9 s; all recovered |
+| End | **the process was gone at 6.1 min, exit code 0**, the watchdog not involved (816 MB available at its last sample) |
+
+No record of why: no panic or error in our log, no entry in the title's
+`crashes.log` or crash-context files, nothing in the Windows Application
+or System logs at that minute. The title's own last lines are ordinary
+shader translations. Exit code 0 means the process ended itself (an
+`ExitProcess(0)`), not an exception. With RAM at 0 MiB three times in the
+minute before, an allocation failure the title answers by quitting is
+the likely reading; **not proven**.
+
+Compared with #34 (same lowmem preset plus the compile gate, capture and
+tracing): slower to the world (277 s against 85 s, without the capture's
+side effects explaining it) and fewer frames per second (1.60 against
+1.90 in heavy scenes). One run each: the spread between runs here has
+been 15 % or more, so this is no measurement of the switches.
+
+## Audit of Tests #30-#38
 
 What is established, by run evidence:
 
