@@ -152,6 +152,38 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+On the 16 GB Radeon 780M laptop, `run-laptop.ps1` selects the newest build
+in `target-planes` or `target`, enables the measured Series S memory profile,
+the built-in upscaler and the ambient-light fallback:
+
+```powershell
+.\run-laptop.ps1 -GameDir "D:\path\to\your\game"
+```
+
+The default `auto` preset selects conservative settings on systems with 16 GB
+of RAM. Use `-Preset low|balanced|quality` to choose explicitly. The low preset
+uses the cheaper bilinear filter, caps optional host texture copies at 1 GB,
+and stops optional uploads below 3 GB of free physical memory. `-AutoStart`
+uses the diagnostics build and presses pad A through the first screens. Use
+`-Safe` to turn the submission relay off, `-Bilinear` for the cheaper filter,
+or `-NoAmbient` to inspect the title's lighting without the fallback. The
+launcher warns on 16 GB systems because the current world can still page
+heavily after boot even with the low preset.
+
+To enter the opening cutscene without continuing to press A during it, capture
+its rendered frames, and log the connected XInput pad's button changes, run:
+
+```powershell
+.\run-laptop.ps1 -GameDir "D:\path\to\your\game" -CutsceneTest
+```
+
+The capture folder is printed at launch. Pass `-CaptureDir <folder>` to choose
+one, or add `-NoCapture` for a faster full-cutscene run. Press a controller
+button during the run to see its state in the console. The balanced and quality
+presets also use progressively less aggressive shader-loop limits (256 and
+1,024) for better visual correctness than the low preset's performance-first
+limit of 64.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -198,6 +230,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_INPUT_LOG=1` | logs XInput connection and button/trigger changes |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |

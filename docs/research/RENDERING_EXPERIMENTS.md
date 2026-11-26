@@ -207,3 +207,36 @@ stale data on screen.
   pick mip levels. A read-back that comes back wrong (zeros: "the finest
   level everywhere") would fill the pool. To check: find the streaming
   feedback pass and what it writes; compare what the CPU gets back.
+
+## E20 (2026-11-25): an imported Chapter 4 save, and a temporal upscaler (`VICTORY_FFX_TEMPORAL`)
+
+- Save: a decrypted PS5 story save converted to the Xbox container format
+  (format from LilBigJP/ztrx-ps5-save-import), loaded with the opt-in
+  `VICTORY_PATCH` (the title's story-save encryption check answers "no";
+  the patch checks the original bytes first). Not in the repository.
+- Without the temporal pass (run `save-run`, `-Preset low`): the save
+  loads, the city loads, the player is in control with the HUD at
+  ~1.3 fps, 12.4 GB RAM, VRAM 6.7 of 5.8 GB budget. Visible defects:
+  grainy hair and cloth (stochastic/dithered shading the title leaves to
+  FSR4 to resolve over frames), black blocks over the sky's clouds (present
+  on the loading screen too, so before the upscaler), very dark shadows
+  (no ray-traced light).
+- The FidelityFX dispatch carries what a temporal upscaler needs: colour
+  1280x720 RGBA16F, depth, motion vectors 1280x720 RG16F, motion-vector
+  scale `[1, 1]` (render texels), a reset flag. No exposure or masks.
+- Temporal pass (`VICTORY_FFX_TEMPORAL=1`, weight 0.1): the spatial result
+  blended with our own history pair (2 x 1920x1080 RGBA16F, 33 MB),
+  reprojected by the motion vectors, clipped to the colour's 3x3
+  neighbourhood in YCoCg, non-finite values dropped.
+- Result: **3 of 3 runs failed before gameplay** (runs `taa-run`,
+  `taa-run2`, `taa-run3`): twice a host list did not close with
+  E_OUTOFMEMORY about 2 minutes after the first temporal upscaling, once a
+  device removal after a 60 s submission one second after the first one.
+  RAM and VRAM in the title bar were not higher than without it.
+- Debug run (`VICTORY_D3D12_DEBUG=1`): no debug layer (0x887A002D, the
+  Windows "Graphics Tools" feature is not installed); the same
+  E_OUTOFMEMORY, with allocations as small as 256 bytes refused.
+- Baseline again without the temporal pass (run `base-run`): **also a
+  device removal after a 60 s submission.** So the failures are not shown
+  to come from the temporal pass; with this save the 16 GB UMA laptop is
+  over its GPU budget and runs fail either way. Kept off by default.
