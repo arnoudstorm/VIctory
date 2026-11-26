@@ -188,13 +188,37 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+    if file_holds(path, bytes) {
         return Ok(());
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
     Ok(())
+}
+
+/// Whether the file at `path` holds exactly `bytes`, compared a megabyte at
+/// a time: reading it whole held a third copy of the image at boot
+/// (114.6 MB, Test 11f).
+fn file_holds(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.metadata().map(|m| m.len()).ok() != Some(bytes.len() as u64) {
+        return false;
+    }
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let n = chunk.len().min(rest.len());
+        if file.read_exact(&mut chunk[..n]).is_err() || chunk[..n] != rest[..n] {
+            return false;
+        }
+        rest = &rest[n..];
+    }
+    // Nothing past the expected length (the file grew after the check).
+    file.read(&mut chunk[..1]).is_ok_and(|extra| extra == 0)
 }
 
 impl LoadedImage {
@@ -433,5 +457,32 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_holds_compares_whole_files_in_chunks() {
+        let dir = std::env::temp_dir().join(format!("victory-file-holds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.bin");
+        // Longer than one chunk, with a difference in the second.
+        let bytes: Vec<u8> = (0..(3 << 19) as u32).map(|i| (i * 7 + 3) as u8).collect();
+        assert!(!file_holds(&path, &bytes), "missing file");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(file_holds(&path, &bytes));
+        let mut other = bytes.clone();
+        other[(1 << 20) + 5] ^= 1;
+        assert!(!file_holds(&path, &other), "differs past the first chunk");
+        assert!(!file_holds(&path, &bytes[..bytes.len() - 1]), "file longer");
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(!file_holds(&path, &longer), "file shorter");
+        write_if_changed(&path, &other).unwrap();
+        assert!(file_holds(&path, &other), "rewritten");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

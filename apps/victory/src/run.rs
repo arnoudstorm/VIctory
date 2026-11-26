@@ -93,6 +93,9 @@ pub fn run(
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
+    // `prepare` made its own patched copy: the file's bytes are not needed
+    // again (Test 11f: three 114.6 MB blocks of the image alive at boot).
+    drop(original);
     apply_byte_patches(&mut prepared)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
@@ -108,7 +111,6 @@ pub fn run(
     // whole run (two blocks of 114.7 MB each for the title, in
     // physical memory: run 65's memory map).
     drop(prepared);
-    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
