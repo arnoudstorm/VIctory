@@ -6489,6 +6489,46 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
+/// Maximum disjoint title-memory refresh intervals retained per host copy.
+/// The default of one preserves the established hull behavior. Values above
+/// one are an opt-in experiment; values are capped to bound bookkeeping.
+fn refresh_interval_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_REFRESH_INTERVALS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 32)
+    })
+}
+
+/// Adds a requested interval, joining overlaps and neighbours. If the
+/// bounded list is still too long, join the pair separated by the smallest
+/// gap. This minimizes extra bytes while keeping per-copy work bounded.
+fn add_refresh_interval(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize, limit: usize) {
+    if start >= end {
+        return;
+    }
+    ranges.push((start, end));
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    while joined.len() > limit.max(1) {
+        let at = (0..joined.len() - 1)
+            .min_by_key(|&i| joined[i + 1].0 - joined[i].1)
+            .expect("at least two intervals");
+        joined[at].1 = joined[at + 1].1;
+        joined.remove(at + 1);
+    }
+    *ranges = joined;
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -6499,7 +6539,7 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6516,11 +6556,13 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                add_refresh_interval(&mut r.1, address, end, refresh_interval_limit());
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                let mut ranges = Vec::new();
+                add_refresh_interval(&mut ranges, address, end, refresh_interval_limit());
+                self.refreshes.push((shadow.clone(), ranges));
             }
         }
     }
@@ -6531,12 +6573,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in ranges {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6574,7 +6618,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6588,19 +6632,75 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| {
+                    Box::new(move || {
+                        for (from, to) in ranges {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                for (from, to) in ranges {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
             crate::watch::ask_ahead_done();
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_interval_tests {
+    use super::add_refresh_interval;
+
+    #[test]
+    fn bounded_ranges_preserve_requested_bytes_and_merge_the_smallest_gaps() {
+        let mut ranges = Vec::new();
+        let mut requested = 0usize;
+        for i in 0..32 {
+            let start = i * 512 * 1024;
+            let end = start + 4 * 1024;
+            requested += end - start;
+            add_refresh_interval(&mut ranges, start, end, 16);
+        }
+
+        let hull_bytes = ranges.last().unwrap().1 - ranges[0].0;
+        let bounded_bytes = ranges.iter().map(|(start, end)| end - start).sum::<usize>();
+        assert_eq!(ranges.len(), 16);
+        assert_eq!(requested, 32 * 4 * 1024);
+        assert!(bounded_bytes >= requested);
+        assert!(bounded_bytes < hull_bytes * 3 / 4);
+        assert!(ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+        eprintln!(
+            "synthetic 32x4KiB refreshes: requested={requested} B, hull={hull_bytes} B, bounded={bounded_bytes} B, saved={} B ({:.1}%)",
+            hull_bytes - bounded_bytes,
+            (hull_bytes - bounded_bytes) as f64 * 100.0 / hull_bytes as f64
+        );
+    }
+
+    #[test]
+    fn overlaps_and_adjacent_ranges_are_merged_without_gaps() {
+        let mut ranges = Vec::new();
+        for range in [(100, 120), (110, 140), (140, 150), (10, 20)] {
+            add_refresh_interval(&mut ranges, range.0, range.1, 8);
+        }
+        assert_eq!(ranges, [(10, 20), (100, 150)]);
+    }
+
+    #[test]
+    fn cap_merges_the_smallest_gap_first() {
+        let mut ranges = Vec::new();
+        for range in [(0, 10), (100, 110), (111, 120), (1000, 1010)] {
+            add_refresh_interval(&mut ranges, range.0, range.1, 3);
+        }
+        assert_eq!(ranges, [(0, 10), (100, 120), (1000, 1010)]);
     }
 }
 
