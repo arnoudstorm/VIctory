@@ -413,13 +413,22 @@ fn who_made_big(size: usize) {
     }
     if TOLD.fetch_add(1, Relaxed) < WHO_MOST {
         let trace = std::backtrace::Backtrace::force_capture().to_string();
-        // Our own frames only, without the allocator's.
-        let frames: Vec<&str> = trace
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.contains("victory") && !l.contains("copystat::") && !l.starts_with("at "))
-            .take(8)
-            .collect();
+        // The callers' frames, without the allocator's and the standard
+        // library's. Game test 11d logged three 114 MB blocks and one of
+        // 82 MB with no frame at all: frames of generic code and closures
+        // need not name the crate, so any frame outside std/alloc/core
+        // counts. With none left, the first raw lines are kept instead.
+        let named = |l: &&str| {
+            !l.starts_with("at ")
+                && !l.contains("copystat::")
+                && ![" std::", " alloc::", " core::", " hashbrown::", "__rust", "<unknown>", "backtrace"]
+                    .iter()
+                    .any(|skip| l.contains(skip))
+        };
+        let mut frames: Vec<&str> = trace.lines().map(str::trim).filter(named).take(12).collect();
+        if frames.is_empty() {
+            frames = trace.lines().map(str::trim).filter(|l| !l.starts_with("at ")).take(16).collect();
+        }
         tracing::info!(mb = size >> 20, frames = ?frames, "a block of 32 MB or more made");
     }
     INSIDE.with(|i| i.set(false));
