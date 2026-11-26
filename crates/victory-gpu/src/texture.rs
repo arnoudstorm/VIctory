@@ -917,13 +917,26 @@ static UPLOADED_PRINT: std::sync::Mutex<Option<std::collections::HashMap<usize, 
 pub(crate) static MISSED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
-/// At submission, after the staging refresh: `uploading` says whether this
-/// submission copies the staging buffer into the host texture.
+/// Computes the title-memory fingerprint shared by both submission-time
+/// diagnostic observers. Keep this read before `take_upload` so its timing
+/// matches the former read-at-submission observation.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn note_upload_decision(staging: &std::sync::Arc<Staging>, uploading: bool) {
+pub(crate) fn submission_fingerprint(staging: &std::sync::Arc<Staging>) -> u64 {
+    let (at, len) = staging.memory();
+    fingerprint(at as u64, len as u64)
+}
+
+/// At submission, after the staging refresh: `uploading` says whether this
+/// submission copies the staging buffer into the host texture. `print` is
+/// the same pre-upload fingerprint recorded by `note_read_at_submission`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_upload_decision(
+    staging: &std::sync::Arc<Staging>,
+    uploading: bool,
+    print: u64,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let (at, len) = staging.memory();
-    let print = fingerprint(at as u64, len as u64);
     let key = std::sync::Arc::as_ptr(staging) as usize;
     let mut prints = UPLOADED_PRINT.lock().unwrap_or_else(|e| e.into_inner());
     let prints = prints.get_or_insert_with(Default::default);
@@ -945,9 +958,7 @@ pub(crate) fn note_upload_decision(staging: &std::sync::Arc<Staging>, uploading:
 }
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn note_read_at_submission(staging: &std::sync::Arc<Staging>) {
-    let (at, len) = staging.memory();
-    let print = fingerprint(at as u64, len as u64);
+pub(crate) fn note_read_at_submission(staging: &std::sync::Arc<Staging>, print: u64) {
     let mut read = READ_THIS_FRAME.lock().unwrap_or_else(|e| e.into_inner());
     if read.len() < 256 && !read.iter().any(|(s, _)| std::sync::Arc::ptr_eq(s, staging)) {
         read.push((staging.clone(), print));
@@ -1528,5 +1539,45 @@ mod title_memory_tests {
             resource, 0x10,
         );
         assert_eq!(release(resource), 0);
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod fingerprint_bench_tests {
+    use super::fingerprint;
+
+    /// Synthetic cost comparison for the old two-observer path versus the
+    /// shared one-fingerprint path. This measures the kernel reads and hash
+    /// work only; it does not model concurrent title writes or frame time.
+    #[test]
+    #[ignore = "diagnostic microbenchmark; run alone with --nocapture"]
+    fn shared_submission_fingerprint_cost() {
+        const REPETITIONS: usize = 256;
+        let mut bytes = vec![0x5a; 128 << 10];
+        let at = bytes.as_mut_ptr() as u64;
+        let len = bytes.len() as u64;
+        let expected = fingerprint(at, len);
+        let start = std::time::Instant::now();
+        for _ in 0..REPETITIONS {
+            assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+            assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+        }
+        let duplicate = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..REPETITIONS {
+            assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+        }
+        let shared = start.elapsed();
+        let sampled_bytes = 3 * (16 << 10);
+        eprintln!(
+            "fingerprint synthetic reps={REPETITIONS} sampled_bytes_each={sampled_bytes} old_calls={} old_bytes={} old_us={} shared_calls={} shared_bytes={} shared_us={}",
+            2 * REPETITIONS,
+            2 * REPETITIONS * sampled_bytes,
+            duplicate.as_micros(),
+            REPETITIONS,
+            REPETITIONS * sampled_bytes,
+            shared.as_micros(),
+        );
+        std::hint::black_box(&mut bytes);
     }
 }

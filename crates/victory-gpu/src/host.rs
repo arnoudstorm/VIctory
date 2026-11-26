@@ -5918,10 +5918,13 @@ impl HostList {
                 .iter()
                 .filter_map(|(copy, staging)| {
                     #[cfg(feature = "diagnostics")]
-                    crate::texture::note_read_at_submission(staging);
+                    let print = crate::texture::submission_fingerprint(staging);
                     let upload = staging.take_upload();
                     #[cfg(feature = "diagnostics")]
-                    crate::texture::note_upload_decision(staging, upload);
+                    {
+                        crate::texture::note_read_at_submission(staging, print);
+                        crate::texture::note_upload_decision(staging, upload, print);
+                    }
                     if upload {
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::TexUploads, 1);
