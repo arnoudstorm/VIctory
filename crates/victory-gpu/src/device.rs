@@ -349,8 +349,13 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
+/// object `out` names and draws with it. On failure it does not go
+/// without: both are its pipeline library's precompiled path (about 16,000
+/// graphics and 2,000 compute pipelines tried in the first second), and
+/// it makes each pipeline when needed through the methods we answer
+/// (title+0x247fe39 falls back to 0x1f0, `create_compute_x`, when 0x218
+/// gives none). The descriptions are (pointer, size) pairs: per stage a
+/// metadata block and native GFX10 code. Still unimplemented: the calls
 /// fail as they always did, with `out` null, and the first ones log the
 /// description's words and what its first word points at, so that the two
 /// methods can be written.
@@ -393,7 +398,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a precompiled-pipeline method that is not implemented: the title makes the pipeline the ordinary way instead"
         );
     }
     E_NOTIMPL

@@ -240,3 +240,17 @@ stale data on screen.
   device removal after a 60 s submission.** So the failures are not shown
   to come from the temporal pass; with this save the 16 GB UMA laptop is
   over its GPU budget and runs fail either way. Kept off by default.
+
+## E21 (2026-11-26): the "missing pipelines" are the title's precompiled cache, not missing
+
+- Run `perf-run` (same settings as E20's baseline): loading screen 30 fps
+  at 1.3 GB VRAM; in the world 1.3-1.4 fps (~700 ms: ~240 ms preparing
+  copies and textures, ~400 ms waiting for the card), VRAM 6.4 of 5.7 GB,
+  the PC's free memory down to 22 MB, then E_OUTOFMEMORY after ~100 s.
+- Device slots 0x1c8 and 0x218 (unimplemented, E_NOTIMPL) are called
+  about 16,000 and 2,000 times, all in the first second: the title's
+  pipeline library trying precompiled (native GFX10) pipelines. The
+  disassembly at title+0x247fe25 shows that when 0x218 gives none, the
+  title makes the pipeline through 0x1f0 (`create_compute_x`); graphics
+  pipelines are made on demand through `create_stream`. So they are not
+  the cause of the black cloud blocks; the log text is corrected.
