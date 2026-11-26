@@ -191,7 +191,10 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
     let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
     let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
     let file = path.rsplit('\\').next()?;
-    crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
+    let address = crate::registry::lookup(file, &symbol);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let address = address.or_else(|| crate::memory_events::wrap(file, &symbol));
+    address.map(|address| address as *mut c_void)
 }
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`

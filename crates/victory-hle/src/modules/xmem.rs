@@ -166,6 +166,8 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    #[cfg(feature = "diagnostics")]
+    crate::memory_events::record("XMemVirtualAlloc/VirtualAlloc2", base as usize, size, kind, at as usize, 0);
     if base.is_null() {
         tracing::debug!(
             size,
@@ -331,7 +333,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            let released = VirtualFree(address, 0, MEM_RELEASE);
+            #[cfg(feature = "diagnostics")]
+            crate::memory_events::record("XMemFreeDefault/VirtualFree", address as usize, 0, MEM_RELEASE, released as usize, 0);
+            let _ = released;
             return;
         }
         let user = address.cast::<u8>();
@@ -436,6 +441,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { count.write(0) };
         return 0;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::memory_events::record("XMemAllocatePhysicalPages/section", 0, size, if pool_committed() { SEC_COMMIT } else { SEC_RESERVE }, handle as usize, 0);
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
@@ -504,6 +511,8 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::memory_events::record_mapping("XMemPhysical/transient-map",at.Value as usize,len,slice.section.0 as usize,offset);
         let view = View { at, len };
         commit(at.Value as usize, len).then_some(view)
     }
@@ -520,7 +529,10 @@ impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        let unmapped = unsafe { UnmapViewOfFile(self.at) };
+        #[cfg(feature = "diagnostics")]
+        crate::memory_events::record("XMemPhysical/transient-unmap",self.at.Value as usize,self.len,0,unmapped as usize,0);
+        let _ = unmapped;
     }
 }
 
@@ -790,6 +802,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     physical.views.insert(base, (len, slice));
+    #[cfg(feature = "diagnostics")]
+    if let Some((_, slice))=physical.views.get(&base) {
+        crate::memory_events::record_mapping("XMemPhysical/map",base,len,slice.section.0 as usize,(slice.index*PAGE) as u64);
+    }
     true
 }
 
@@ -799,7 +815,10 @@ fn commit(base: usize, len: usize) -> bool {
         return true; // the section is committed whole
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    let committed = unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) };
+    #[cfg(feature = "diagnostics")]
+    crate::memory_events::record("XMemPhysical/commit", base, len, MEM_COMMIT, committed as usize, 0);
+    if !committed.is_null() {
         return true;
     }
     let error = std::io::Error::last_os_error();

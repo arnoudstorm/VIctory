@@ -22,6 +22,11 @@ pub fn main_image() -> Option<usize> {
 /// Original file of each title image we mapped, by base address.
 static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn image_paths() -> Vec<(usize, PathBuf)> {
+    IMAGE_PATHS.lock().unwrap_or_else(|e|e.into_inner()).clone()
+}
+
 /// Records the file a title image was mapped from: the title asks for its
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.

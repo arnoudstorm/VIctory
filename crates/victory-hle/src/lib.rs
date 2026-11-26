@@ -14,6 +14,10 @@
 mod host;
 pub mod modules;
 mod registry;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod memory_events;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod memory_regions;
 pub mod runtime;
 
 pub use host::HostPolicy;
@@ -53,10 +57,11 @@ impl ImportResolver for HleResolver {
             };
         }
         match self.host.resolve(dll, symbol) {
-            Some(address) => Resolution::Found {
-                address,
-                provenance: Provenance::Host,
-            },
+            Some(address) => {
+                #[cfg(all(windows, feature = "diagnostics"))]
+                let address = memory_events::wrap(dll, &symbol.to_string()).unwrap_or(address);
+                Resolution::Found { address, provenance: Provenance::Host }
+            }
             None => Resolution::Missing,
         }
     }
