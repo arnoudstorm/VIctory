@@ -68,7 +68,12 @@ if ($Preset -eq 'auto') {
 $profile = switch ($Preset) {
     'low' {
         @{
-            Relay = '0'
+            # Copy-back on a second thread, and reads of title memory wait
+            # only for the flights that wrote it: world frames 2.3 s -> 1.2 s
+            # on the 780M (docs/SESSIONS-2026-11-24-25.md, docs/audit-780m.md).
+            # The device removals seen with it were memory exhaustion
+            # (docs/updates/update-4-relay-off.md). -Safe turns it off.
+            Relay = '2'
             Filter = 'bilinear'
             TextureStageMB = '32'
             TextureStageMS = '100'
@@ -89,7 +94,7 @@ $profile = switch ($Preset) {
         # 'low' with a smaller host texture budget, fewer kept snapshots and
         # translated loops stopped sooner.
         @{
-            Relay = '0'
+            Relay = '2'
             Filter = 'bilinear'
             TextureStageMB = '16'
             TextureStageMS = '100'
