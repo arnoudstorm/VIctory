@@ -64,6 +64,31 @@ pub struct Bools {
     born: Vec<usize>,
     ids: Map<Atom, u32>,
     overflow: bool,
+    /// Counted into [`HELD`] already (when built).
+    recorded: bool,
+}
+
+impl Drop for Bools {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.record();
+        }
+    }
+}
+
+impl Bools {
+    /// Counts its tables' size into [`HELD`].
+    fn record(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.recorded = true;
+        let bytes = self.reserved_bytes();
+        HELD[0].fetch_add(1, Relaxed);
+        HELD[1].fetch_max(bytes, Relaxed);
+        if bytes >= 32 << 20 {
+            HELD[2].fetch_add(1, Relaxed);
+            HELD[3].fetch_add(bytes, Relaxed);
+        }
+    }
 }
 
 /// The tables below have small integer keys; SipHash dominated run time.
@@ -99,6 +124,13 @@ impl Hasher for Fx {
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
+/// Results [`Bools::ite`] remembers before it forgets them all and starts
+/// over. The memo only saves recomputing (equal functions are equal nodes
+/// through `unique` either way), but unbounded it grew to 34-68 MiB per
+/// shader, with up to eight shaders structured at once while a title loads
+/// (the runtime's pipeline workers): bounded, its table stays near 9 MiB.
+/// (Tests run with a tiny one: every result must come out the same.)
+const MAX_MEMO: usize = if cfg!(test) { 64 } else { 1 << 18 };
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 /// Conditions [`Meets`] keeps; past that, they are searched anew.
@@ -112,7 +144,25 @@ pub struct Meets {
     none: Map<Box<[u32]>, usize>,
 }
 
+/// What [`Bools`] held when let go: how many were let go, the largest (bytes
+/// of its tables' capacity, which never shrinks), how many held 32 MiB or
+/// more, and their bytes summed. For the offline batch and the runtime's
+/// memory lines.
+pub static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 impl Bools {
+    /// Bytes its tables reserve (capacity; a hash table entry is its key and
+    /// value plus one control byte).
+    pub fn reserved_bytes(&self) -> u64 {
+        let entry = |k: usize, v: usize| (k + v + 1) as u64;
+        self.nodes.capacity() as u64 * std::mem::size_of::<(u32, Bool, Bool)>() as u64
+            + self.unique.capacity() as u64 * entry(12, 4)
+            + self.memo.capacity() as u64 * entry(12, 4)
+            + self.atoms.capacity() as u64 * std::mem::size_of::<Atom>() as u64
+            + self.born.capacity() as u64 * 8
+            + self.ids.capacity() as u64 * entry(std::mem::size_of::<Atom>(), 4)
+    }
+
     fn new() -> Self {
         Bools {
             nodes: vec![
@@ -125,6 +175,7 @@ impl Bools {
             born: Vec::new(),
             ids: Map::default(),
             overflow: false,
+            recorded: false,
         }
     }
 
@@ -212,8 +263,20 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
+        if self.memo.len() >= MAX_MEMO {
+            self.memo.clear();
+        }
         self.memo.insert((f, g, h), r);
         r
+    }
+
+    /// Done building: the tables only building reads (`memo`, `unique`)
+    /// are let go. What reads a [`Structured`] reads its nodes.
+    fn built(mut self) -> Bools {
+        self.record();
+        self.memo = Map::default();
+        self.unique = Map::default();
+        self
     }
 
     fn and(&mut self, a: Bool, b: Bool) -> Bool {
@@ -868,7 +931,7 @@ impl<'a> Lanes<'a> {
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
             phi_masks,
-            bools: self.b,
+            bools: self.b.built(),
             exits,
             guards,
             reach: cond.to_vec(),
