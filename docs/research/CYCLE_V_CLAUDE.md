@@ -90,11 +90,37 @@ same burst with 4 MiB to spare, from 300 MiB more available RAM. **Test #30
 does not measure the change's effect on world preparation.** No gameplay,
 no FPS claim.
 
+## Test #31
+
+Same build (`6E03C128…DCCC`) and switches as Test #30, from more available
+RAM: 9,695 MiB at guard start (Test #29: 9,205).
+
+| | Test #29 | Test #30 | Test #31 |
+|---|---:|---:|---:|
+| Available at guard start | 9,205 MiB | 8,903 MiB | 9,695 MiB |
+| Runtime | 178.7 s | ~147 s | ~104 s |
+| Stage reached | world preparation | loading | loading |
+| Minimum available | 4 MiB | 45 MiB | 75 MiB |
+| Window tiles at the end | 1,498 MiB | 421 MiB | 3 MiB |
+| Working set late in loading | ~3.1-3.4 GB | ~3.7-4.2 GB | ~6.6-7.0 GB |
+| Private bytes at the stop | — | ~9.6 GB | ~8.1 GB |
+
+Emergency stop again, in loading, with 3 MiB of window tiles: shared tiles
+had nothing to act on. Starting RAM does not predict how far a run gets:
+Test #31 started highest and ended earliest. Its working set held twice
+Test #29's at the same stage (Windows trimmed Test #29 harder), so the
+loading burst met less free memory. Private bytes alone (8.1 GB, below
+Test #29's 10.7 GB peak) did not decide it.
+
+Three runs of this configuration stopped before world preparation two times
+out of three. A fourth identical launch would repeat that gamble, so no
+further launch until the loading burst is reduced.
+
 ## Next
 
 1. The loading burst (E27's unattributed ~1.8 GB, here ~2 GB) decides
    whether a run reaches world preparation at all; it is the first gate.
-2. Test #31: the same configuration from more available RAM (Test #29's
-   start or higher), to measure shared tiles over world preparation.
+2. Measure shared tiles over world preparation once a run reliably gets
+   there (Tests #30 and #31 did not).
 3. Only after a measured world-preparation result: consider shared tiles
    for `run-laptop.ps1`; it stays off by default until then.
