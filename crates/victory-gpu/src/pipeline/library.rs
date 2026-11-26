@@ -610,17 +610,23 @@ static HELD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// is room: compiles run as they always did.
 fn room_to_compile() -> Option<MutexGuard<'static, ()>> {
     let limit = compile_headroom();
+    let floor = compile_min_avail();
     #[cfg(windows)]
     let room = commit_room();
     #[cfg(not(windows))]
     let room: Option<u64> = None;
-    if limit == 0 || room.is_none_or(|r| r >= limit) {
+    #[cfg(windows)]
+    let physical = crate::host::available_physical_ram;
+    #[cfg(not(windows))]
+    let physical = || -> Option<u64> { None };
+    let short = |room: Option<u64>, available: Option<u64>| short_of_room(room, limit, available, floor);
+    if !short(room, physical()) {
         return None;
     }
     let guard = SHORT_OF_ROOM.lock().unwrap_or_else(|e| e.into_inner());
     let began = std::time::Instant::now();
     #[cfg(windows)]
-    while began.elapsed() < std::time::Duration::from_secs(10) && commit_room().is_some_and(|r| r < limit) {
+    while began.elapsed() < std::time::Duration::from_secs(10) && short(commit_room(), physical()) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let held = HELD[0].fetch_add(1, Ordering::Relaxed) + 1;
@@ -631,10 +637,35 @@ fn room_to_compile() -> Option<MutexGuard<'static, ()>> {
             waited_ms = waited,
             room_mb = room.unwrap_or(0) >> 20,
             limit_mb = limit >> 20,
-            "driver compiles held back: the system's commit room is short (VICTORY_COMPILE_HEADROOM_MB)"
+            avail_floor_mb = floor >> 20,
+            "driver compiles held back: the system's commit room or physical RAM is short (VICTORY_COMPILE_HEADROOM_MB, VICTORY_COMPILE_MIN_AVAIL_MB)"
         );
     }
     Some(guard)
+}
+
+/// Available physical RAM below which driver compiles go one at a time, as
+/// when commit room is short, in bytes: `VICTORY_COMPILE_MIN_AVAIL_MB` (1024
+/// unless set; 0 turns this part of the gate off). Commit room alone never
+/// trips on a 16 GB laptop with a large page file (≈13 GB of commit room
+/// while available RAM fell to ≈200 MB in runs 5-10), so the gate also asks
+/// the RAM the driver's compile memory actually takes.
+fn compile_min_avail() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_COMPILE_MIN_AVAIL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// Whether a compile must wait: commit `room` under `limit`, or `available`
+/// physical RAM under `floor` (a 0 limit or floor turns that part off; an
+/// unknown figure never holds a compile back).
+fn short_of_room(room: Option<u64>, limit: u64, available: Option<u64>, floor: u64) -> bool {
+    (limit != 0 && room.is_some_and(|r| r < limit)) || (floor != 0 && available.is_some_and(|a| a < floor))
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -793,6 +824,20 @@ mod tests {
         assert_eq!(headroom_setting(Some("2048")), 2048 << 20);
         assert_eq!(headroom_setting(Some(" 0 ")), 0);
         assert_eq!(headroom_setting(Some("lots")), 1536 << 20);
+    }
+
+    /// The gate trips on either commit room or physical RAM; a part whose
+    /// threshold is 0 or whose figure is unknown never trips it.
+    #[test]
+    fn compile_gate_asks_commit_room_and_physical_ram() {
+        const G: u64 = 1 << 30;
+        // Run 10's shape: plenty of commit room, physical RAM nearly gone.
+        assert!(short_of_room(Some(13 * G), 1536 << 20, Some(200 << 20), 1024 << 20));
+        assert!(!short_of_room(Some(13 * G), 1536 << 20, Some(3 * G), 1024 << 20));
+        assert!(short_of_room(Some(G), 1536 << 20, Some(3 * G), 1024 << 20));
+        assert!(!short_of_room(Some(13 * G), 1536 << 20, Some(200 << 20), 0));
+        assert!(!short_of_room(Some(G), 0, Some(3 * G), 1024 << 20));
+        assert!(!short_of_room(None, 1536 << 20, None, 1024 << 20));
     }
 
     #[cfg(windows)]
