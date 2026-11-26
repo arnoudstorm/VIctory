@@ -216,9 +216,9 @@ fn sample(mut out: impl Write) -> std::io::Result<()> {
         }
         let (working, private) = crate::copystat::process_memory();
         let (available, commit_left) = crate::copystat::system_memory();
-        let (started_submissions, retired, completed) = crate::host::allocation_fence_snapshot();
-        let local = crate::host::host().and_then(crate::host::Host::video_memory);
-        let dxgi = local.map_or_else(|| "null".to_owned(), |v| format!("{v:?}"));
+        let (started_submissions, retired, completed, video_memory) =
+            crate::host::allocation_fence_snapshot();
+        let dxgi = video_memory.map_or_else(|| "null".to_owned(), |v| format!("{v:?}"));
         let textures = crate::resource::texture_memory_totals();
         let staging = crate::texture::staged_bytes_for_sampler();
         let shadows = crate::shadow::live_copy_bytes_for_sampler();

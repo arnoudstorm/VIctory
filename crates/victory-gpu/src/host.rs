@@ -224,10 +224,13 @@ pub(crate) fn retire<T: 'static>(object: T) {
 }
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn allocation_fence_snapshot() -> (u64, u64, u64) {
+pub(crate) fn allocation_fence_snapshot() -> (u64, u64, u64, Option<[u64; 4]>) {
+    // A sampler must never initialize a device or block behind initialization.
+    let host = HOST.get().and_then(Option::as_ref);
     // SAFETY: a query on the live host fence. Device removal returns UINT64_MAX.
-    let completed = host().map_or(0, |host| unsafe { host.fence.GetCompletedValue() });
-    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire), completed)
+    let completed = host.map_or(0, |host| unsafe { host.fence.GetCompletedValue() });
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire), completed,
+        host.and_then(Host::video_memory))
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -548,10 +551,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
