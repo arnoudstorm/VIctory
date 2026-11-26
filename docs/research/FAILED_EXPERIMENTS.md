@@ -127,3 +127,9 @@ quality, not correctness of the rest of the frame.
 ## 2026-11-26 implementation checkpoint
 
 No new failed optimization candidate. The pre-fix synthetic alias case was intentionally required to fail: producer bytes were correct while the placed SRV returned zeros. The source-tracking correction passed its synthetic test twice in separate synchronous/deferred queue configurations. Existing E17 window merging remains rejected and was not repeated. The shared fingerprint change measured an isolated microbenchmark only; no gameplay-frame gain is established. Descriptor instrumentation is observational and reports released dynamic slots that still own COM resources; it does not prove unique/sole ownership or physical reclamation. The new standard release candidate has not been launched. See the E23 implementation entry in `RENDERING_EXPERIMENTS.md` and the current queue in `NEXT_STEPS.md`.
+
+## E25 validation notes — 2026-11-26
+
+- An earlier parallel `cargo test --workspace --all-targets` invocation exited with Windows `STATUS_ACCESS_VIOLATION (0xc0000005)` in the GPU test process before printing a test summary. A serial GPU crate run passed 146 tests (13 ignored), and the later full workspace serial run passed 565 tests (0 failed, 21 ignored, 15 test binaries). Cause of the parallel-process crash is unknown; do not claim a fix.
+- `cargo fmt --all -- --check` reported extensive formatting differences in existing files across the workspace. No formatter was run because it would alter unrelated code. `git diff --check` passed.
+- The first bound-range synthetic assertion expected a fourfold span reduction. With a 16-interval cap and 32 equally spaced requests, the smallest-gap policy correctly retained some gaps; the overly strict assertion was corrected to test less than 75% of the hull. The final measured synthetic span reduction is 48.0%; this is not a runtime performance measurement.

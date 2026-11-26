@@ -30,3 +30,30 @@ The next useful step is a matched, capture-off five-minute low-preset gameplay A
 A fourth commit, `015931ce14e7a2e457f946efcdf14c0d1b9b38ea`, changes only the ignored diagnostics benchmark to alternate seven warm batches and nine 64 MiB cache-evicted approximation samples. The final measured medians and limitations are in `RENDERING_EXPERIMENTS.md` E24 and the performance report. The complete 558-pass workspace suite preceded this test-only harness refinement; the updated ignored harness itself was compiled and passed. The runtime source commits remain the first three listed above.
 
 Final optimized release rebuilt at HEAD `015931ce14e7a2e457f946efcdf14c0d1b9b38ea`: `target\release\victory.exe`, SHA-256 `F503C0D8506B339ABF75F866B9D017447087FF30CE604C0F0AC0843C9CDF04DD`. The binary was never launched. The four existing dead-code warnings remain.
+
+## Next implementation and return-to-laptop checklist
+
+1. Keep using `experiment/780m-alias-memory`. Do not merge or push. Keep the current release candidate and baseline hashes from `SESSION_STATE.md` as the protected references.
+2. On return, do one user-authorized baseline run first with `VICTORY_REFRESH_INTERVALS` unset (default hull) and existing `run-laptop.ps1 -Preset low -Safe -NoCapture`. Capture categorized diagnostics to a persistent log and sample process/system memory at 1 s; abort at the previously documented guardrails. Stop if startup pressure repeats before input/gameplay.
+3. Only if baseline is safe and produces comparable actual gameplay, repeat the same scene/save/input/settings/capture mode with `$env:VICTORY_REFRESH_INTERVALS='16'`. Compare refresh requested bytes, range span/copy traffic, CPU preparation time, GPU wait and frame time; reset environment between runs. A capture-on run is not a performance run.
+4. Do not release descriptor resources yet. Review the new per-second diagnostic counts first; ensure reset, detached lists, replay, multiple same-heap owners and all queue/fence paths before a cleanup change.
+5. Keep Windows preparation reversible: use `outputs/preview-optional-app-memory.ps1 -DryRun` (or its documented preview invocation) to inspect optional apps; manually close only apps you recognize and can reopen after saving work. Do not close Codex, security tools, services or system components. No settings were changed in this session.
+
+Candidate executable: `outputs/VIctory-780m-candidate-3a656f1.exe`; SHA-256 `EF05BB13DB9676C4D73B41772676166F3C9B2B59CAD7D7694D32BACBAB76C96D`; source commit `3a656f1ba191e86014fa5e0024c04f8ec5ade8a`. Candidate has the new interval option, default off. It was built but never launched.
+
+## Exact guarded commands for the next authorized session
+
+Run the diagnostic binary first only when the user has returned and authorized launch. Set `$gameDir` to the installed folder that contains the title's `game_*.exe`. Keep the laptop plugged in and use the same low preset and save. The log is written to the local Victory data folder. Start with interval mode 1 (the unchanged hull):
+
+```powershell
+$repo = 'C:\Users\Arnou\VIctory-laptop'
+$gameDir = Read-Host 'Folder containing game_*.exe'
+$diagExe = 'C:\Users\Arnou\Documents\Codex\2026-11-25\ana\outputs\VIctory-780m-diagnostic-candidate-3a656f1.exe'
+Get-FileHash -Algorithm SHA256 $diagExe
+$env:VICTORY_LOG = 'victory_gpu=info'
+$env:VICTORY_REFRESH_INTERVALS = '1'
+$log = Join-Path $env:LOCALAPPDATA 'victory\diagnostic-startup-default.log'
+& (Join-Path $repo 'run-laptop.ps1') -GameDir $gameDir -BuildPath $diagExe -Preset low -Safe -NoCapture 2>&1 | Tee-Object -FilePath $log
+```
+
+If startup stays above the memory guardrail and a comparable scene is reached, run the **same binary** with `$env:VICTORY_REFRESH_INTERVALS = '16'` and a different log filename. For frame-time A/B, use the normal release candidate for both runs, with the same command and environment values, no capture; change only the interval variable between runs. Collect at least 1 s memory samples externally and stop at the existing guardrail. Do not use a diagnostic run for performance comparisons. The commands are prepared only; nothing was launched in this session.
