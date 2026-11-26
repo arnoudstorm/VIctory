@@ -1493,6 +1493,11 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn live_copy_bytes_for_sampler() -> u64 {
+    LIVE[1].load(Ordering::Relaxed)
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {

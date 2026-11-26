@@ -24,8 +24,12 @@ pub(crate) fn start_allocation_sampler() {
                 let lists: Vec<u64> = crate::host::LISTS.iter().map(|v| v.load(Relaxed)).collect();
                 let detached = crate::host::DETACHED_LISTS.load(Relaxed);
                 let lazy_opens = crate::host::LAZY_OPENED.load(Relaxed);
+                let rust_bytes: u64 = OWN[..4].iter().map(|v| v.load(Relaxed)).sum();
+                let staging = crate::texture::staged_bytes_for_sampler();
+                let shadows = crate::shadow::live_copy_bytes_for_sampler();
+                let textures = crate::resource::HOST_TEXTURES[1].load(Relaxed);
                 let utc_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                if writeln!(file, "{{\"utc_ms\":{utc_ms},\"elapsed_ms\":{},\"private_bytes\":{private},\"working_set_bytes\":{working},\"available_bytes\":{available},\"commit_left_bytes\":{commit_left},\"detached_lists\":{detached},\"lazy_opens_cumulative\":{lazy_opens},\"alive\":{alive:?},\"lists\":{lists:?}}}", began.elapsed().as_millis()).is_err() { return }
+                if writeln!(file, "{{\"utc_ms\":{utc_ms},\"elapsed_ms\":{},\"private_bytes\":{private},\"working_set_bytes\":{working},\"available_bytes\":{available},\"commit_left_bytes\":{commit_left},\"rust_live_bytes\":{rust_bytes},\"staging_bytes\":{staging},\"shadow_copy_bytes\":{shadows},\"host_texture_bytes\":{textures},\"detached_lists\":{detached},\"lazy_opens_cumulative\":{lazy_opens},\"alive\":{alive:?},\"lists\":{lists:?}}}", began.elapsed().as_millis()).is_err() { return }
                 if file.flush().is_err() { return }
                 std::thread::sleep(std::time::Duration::from_millis(allocation_sample_ms(available)));
             }
