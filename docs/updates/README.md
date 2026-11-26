@@ -41,6 +41,7 @@
 
 | Document | What it covers |
 |---|---|
+| `cycle4-memory-780m.md` | 26 Nov: memory by category in loading and the world; the GPU budget is the ceiling |
 | `final-report-2026-11-25.md` | The whole session, with a hand-over list |
 | `audit-2026-11-25.md` | Memory and stability audit |
 | `gameplay-tests-2026-11-25.md` | The five gameplay tests |
