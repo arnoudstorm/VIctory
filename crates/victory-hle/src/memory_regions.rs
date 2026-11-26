@@ -88,11 +88,13 @@ pub(crate) fn start() {
             use std::io::Write;
             let mut file = std::io::BufWriter::new(file);
             let mut before = BTreeMap::new();
+            let interval=std::env::var("VICTORY_REGION_INTERVAL_MS").ok().and_then(|s|s.parse::<u64>().ok()).unwrap_or(5000).clamp(1000,60000);
+            let mut scan=0u64;
             loop {
                 let began = std::time::Instant::now();
                 let utc = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
                 let (after, regions) = snapshot();
-                if modules(&mut file,utc).is_err(){return}
+                if scan%6==0 && modules(&mut file,utc).is_err(){return}
                 let totals: Counts = after.values().fold([0;5], |mut a,b|{for i in 0..5 {a[i]+=b[i];}a});
                 let changes = deltas(&before,&after);
                 // Every changed allocation, not just the largest: correlate by
@@ -104,7 +106,8 @@ pub(crate) fn start() {
                 if writeln!(file,"{{\"utc_ms\":{utc},\"scan_us\":{},\"regions\":{regions},\"totals\":{totals:?}}}",began.elapsed().as_micros()).is_err(){return}
                 if file.flush().is_err(){return}
                 before = after;
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                scan+=1;
+                std::thread::sleep(std::time::Duration::from_millis(interval));
             }
         });
     });
