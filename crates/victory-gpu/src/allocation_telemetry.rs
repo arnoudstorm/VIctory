@@ -67,6 +67,14 @@ static PIPELINE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// Detailed backing events can be much more frequent than large allocations.
+pub(crate) fn window_backing_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_WINDOW_BACKING_LOG").is_some_and(|value| value == "1") && enabled()
+    })
+}
+
 pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
         let Some(path) = std::env::var_os("VICTORY_GPU_ALLOCATION_LOG") else {

@@ -44,6 +44,8 @@ struct Block {
     _cpu_buffer: ID3D12Resource,
     cpu: usize,
     free: Vec<u32>,
+    #[cfg(feature = "diagnostics")]
+    identity: u64,
 }
 
 // SAFETY: the COM objects are free-threaded; `cpu` is an address.
@@ -68,6 +70,8 @@ pub(crate) struct Slot {
     block: usize,
     tile: u32,
     pub(crate) cpu: usize,
+    #[cfg(feature = "diagnostics")]
+    identity: u64,
 }
 
 /// A tile of the pool, zeroed (a window's bytes not copied read 0); `None`
@@ -104,15 +108,23 @@ fn take() -> Option<(Slot, ID3D12Heap)> {
     // SAFETY: a tile of the block's mapped placed buffer, free until now.
     unsafe { std::ptr::write_bytes(cpu as *mut u8, 0, TILE) };
     MAPPED.fetch_add(1, Ordering::Relaxed);
-    Some((Slot { block, tile, cpu }, b.heap.clone()))
+    Some((Slot {
+        block, tile, cpu,
+        #[cfg(feature = "diagnostics")]
+        identity: b.identity * u64::from(PER_HEAP) + u64::from(tile),
+    }, b.heap.clone()))
 }
 
 /// Gives tiles back (only once nothing runs that uses them: see
 /// [`Tiles`]'s drop).
-fn give(slots: Vec<Slot>) {
+fn give(slots: Vec<Slot>, _window: u64) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     for s in slots {
         if let Some(Some(b)) = pool.get_mut(s.block) {
+            #[cfg(feature = "diagnostics")]
+            if _window != 0 {
+                crate::allocation_telemetry::note("window_tile_free", _window, s.identity, 0);
+            }
             b.free.push(s.tile);
             MAPPED.fetch_sub(1, Ordering::Relaxed);
         }
@@ -125,6 +137,10 @@ fn give(slots: Vec<Slot>) {
         .map(|(i, _)| i)
         .collect();
     for &i in empty.iter().skip(1) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(block) = &pool[i] && block.identity != 0 {
+            crate::allocation_telemetry::note("window_heap_free", block.identity, 0, 0);
+        }
         pool[i] = None;
         HEAPS.fetch_sub(1, Ordering::Relaxed);
     }
@@ -159,7 +175,21 @@ fn make_block() -> Option<Block> {
         let cpu_buffer = cpu_buffer?;
         let mut at = std::ptr::null_mut();
         cpu_buffer.Map(0, None, Some(&mut at)).ok()?;
-        Some(Block { heap, _cpu_buffer: cpu_buffer, cpu: at as usize, free: (0..PER_HEAP).rev().collect() })
+        #[cfg(feature = "diagnostics")]
+        let identity = if crate::allocation_telemetry::window_backing_enabled() {
+            use windows::core::Interface;
+            static NEXT_HEAP: AtomicU64 = AtomicU64::new(1);
+            let id = NEXT_HEAP.fetch_add(1, Ordering::Relaxed);
+            crate::allocation_telemetry::note("window_heap_create", id, size, heap.as_raw() as u64);
+            id
+        } else {
+            0
+        };
+        Some(Block {
+            heap, _cpu_buffer: cpu_buffer, cpu: at as usize, free: (0..PER_HEAP).rev().collect(),
+            #[cfg(feature = "diagnostics")]
+            identity,
+        })
     }
 }
 
@@ -197,6 +227,8 @@ pub(crate) fn reserved(size: u64) -> Option<ID3D12Resource> {
 pub(crate) struct Tiles {
     at: Box<[AtomicUsize]>,
     slots: Mutex<Vec<Slot>>,
+    #[cfg(feature = "diagnostics")]
+    window: u64,
 }
 
 /// 64 KiB of zeros: what a tile not mapped reads as.
@@ -204,7 +236,19 @@ static ZEROS: [u8; TILE] = [0; TILE];
 
 impl Tiles {
     pub(crate) fn new(len: usize) -> Tiles {
-        Tiles { at: (0..len.div_ceil(TILE)).map(|_| AtomicUsize::new(0)).collect(), slots: Mutex::default() }
+        Tiles {
+            at: (0..len.div_ceil(TILE)).map(|_| AtomicUsize::new(0)).collect(),
+            slots: Mutex::default(),
+            #[cfg(feature = "diagnostics")]
+            window: 0,
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_window(&mut self, window: u64) {
+        if crate::allocation_telemetry::window_backing_enabled() {
+            self.window = window;
+        }
     }
 
     /// Where offset `off` of the window is, for reading: in its tile, or
@@ -214,6 +258,14 @@ impl Tiles {
             Some(cpu) if cpu != 0 => (cpu + off % TILE) as *const u8,
             _ => ZEROS[off % TILE..].as_ptr(),
         }
+    }
+
+    /// Whether a nonempty byte range already has backing for every tile.
+    /// Slots stay mapped for this window's entire lifetime.
+    pub(crate) fn covers(&self, from: usize, to: usize) -> bool {
+        from < to
+            && self.at.get(from / TILE..to.div_ceil(TILE))
+                .is_some_and(|tiles| tiles.iter().all(|tile| tile.load(Ordering::Acquire) != 0))
     }
 
     /// Where offset `off` of the window is, for writing: its tile mapped
@@ -239,10 +291,14 @@ impl Tiles {
             return std::ptr::null_mut();
         };
         let Some(host) = crate::host::host() else {
-            give(vec![taken]);
+            give(vec![taken], 0);
             return std::ptr::null_mut();
         };
         host.map_tile(buffer, i as u32, &heap, taken.tile);
+        #[cfg(feature = "diagnostics")]
+        if self.window != 0 {
+            crate::allocation_telemetry::note("window_tile_bind", self.window, i as u64, taken.identity);
+        }
         slots.push(taken);
         slot.store(taken.cpu, Ordering::Release);
         (taken.cpu + off % TILE) as *mut u8
@@ -267,11 +323,11 @@ impl Tiles {
 
 /// The tiles of a window let go, given back once every submission running
 /// now has finished.
-struct Back(Vec<Slot>);
+struct Back(Vec<Slot>, u64);
 
 impl Drop for Back {
     fn drop(&mut self) {
-        give(std::mem::take(&mut self.0));
+        give(std::mem::take(&mut self.0), self.1);
     }
 }
 
@@ -279,7 +335,11 @@ impl Drop for Tiles {
     fn drop(&mut self) {
         let slots = std::mem::take(&mut *self.slots.lock().unwrap_or_else(|e| e.into_inner()));
         if !slots.is_empty() {
-            crate::host::retire(Back(slots));
+            #[cfg(feature = "diagnostics")]
+            let window = self.window;
+            #[cfg(not(feature = "diagnostics"))]
+            let window = 0;
+            crate::host::retire(Back(slots, window));
         }
     }
 }

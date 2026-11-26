@@ -28,6 +28,8 @@ use crate::watch::PAGE;
 pub(crate) struct Shadow {
     #[cfg(feature = "diagnostics")]
     _allocation: crate::allocation_telemetry::Lifetime,
+    #[cfg(feature = "diagnostics")]
+    backing_traced: bool,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -1510,6 +1512,10 @@ pub(crate) fn live_copy_bytes_for_sampler() -> u64 {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if self.backing_traced {
+            crate::allocation_telemetry::note("window_drop", self.id, 0, 0);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -1759,6 +1765,38 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    #[cfg(feature = "diagnostics")]
+    fn trace_window_backing(&mut self) {
+        use crate::allocation_telemetry::{note, window_backing_enabled};
+        use windows::core::Interface;
+
+        if !window_backing_enabled() {
+            return;
+        }
+        self.backing_traced = true;
+        let kind = if let Some(tiles) = &mut self.tiles {
+            tiles.trace_window(self.id);
+            "window_reserved"
+        } else if self.place.is_some() {
+            "window_placed"
+        } else {
+            "window_committed"
+        };
+        note(kind, self.id, self.len, self.start);
+        let related = self.place.as_ref().map(|place| place.0.as_raw())
+            .or_else(|| self.card.as_ref().map(|card| card.staging.as_raw()));
+        note("window_resource", self.id, self.buffer.as_raw() as u64, related.map_or(0, |p| p as u64));
+        if kind == "window_committed" && let Some(host) = host() {
+            // SAFETY: plain allocation size queries on live resources.
+            let size = |buffer: &ID3D12Resource| unsafe {
+                host.device.GetResourceAllocationInfo(0, &[buffer.GetDesc()]).SizeInBytes
+            };
+            let main = size(&self.buffer);
+            let staging = self.card.as_ref().map_or(0, |card| size(&card.staging));
+            note("window_commit_size", self.id, main, staging);
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -1827,6 +1865,8 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             _allocation: crate::allocation_telemetry::Lifetime::new(
                 "shadow_create", if data.is_null() || data as u64 == start { 0 } else { len }, 0),
+            #[cfg(feature = "diagnostics")]
+            backing_traced: false,
             buffer,
             data,
             gpu,
@@ -2913,7 +2953,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, WindowLookup::Exact)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -2938,10 +2978,31 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, WindowLookup::Any)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+/// A geometry binding keeps the selected copy and refreshes that same copy
+/// before execution. Prefer existing mapped backing only for these reads.
+pub(crate) fn find_geometry(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if (2..=1 << 20).contains(&len)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_GEOMETRY_WINDOWS").is_some_and(|v| v == "1"))
+        && fine()
+    {
+        lookup(address, len, WindowLookup::MappedGeometry)
+    } else {
+        find_any(address, len)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowLookup {
+    Exact,
+    Any,
+    MappedGeometry,
+}
+
+fn lookup(address: u64, len: u64, mode: WindowLookup) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -2952,7 +3013,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, mode);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -3187,19 +3248,36 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn geometry_holder<'a>(
+    windows: impl Iterator<Item = (&'a (u64, u64), &'a Arc<Shadow>)>,
+    address: u64,
+    end: u64,
+) -> Option<(u64, u64)> {
+    windows.filter(|&(&(start, bytes), shadow)| {
+        start <= address && end <= start + bytes && shadow.tiles.as_ref().is_some_and(|tiles| {
+            tiles.covers((address - start) as usize, (end - start) as usize)
+        })
+    }).map(|(&key, _)| key).min_by_key(|&(start, bytes)| (bytes, start))
+}
+
+fn loose(address: u64, end: u64, unsized_ask: bool, mode: WindowLookup) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
+    } else if mode != WindowLookup::Exact && fine() && !unsized_ask {
         // The windows that begin in the ask's cell at or below the ask (one
         // that begins in a cell below and reaches this far is passed over:
         // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
+        let there = || map.range((cell, 0)..=(address, u64::MAX));
+        let mapped = if mode == WindowLookup::MappedGeometry {
+            geometry_holder(there(), address, end)
+        } else {
+            None
+        };
+        mapped.or_else(|| holder(there().map(|(key, _)| *key), address, end)).unwrap_or(named)
     } else {
         named
     };
@@ -3219,7 +3297,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        let shadow = Shadow::placed(placed, start, len, true);
+        #[cfg(feature = "diagnostics")]
+        let shadow = {
+            let mut shadow = shadow;
+            shadow.trace_window_backing();
+            shadow
+        };
+        let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
@@ -3235,6 +3320,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len);
         shadow.window = true;
         shadow.tiles = Some(crate::tiles::Tiles::new(len as usize));
+        #[cfg(feature = "diagnostics")]
+        shadow.trace_window_backing();
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -3270,6 +3357,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    #[cfg(feature = "diagnostics")]
+    shadow.trace_window_backing();
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3427,6 +3516,156 @@ mod tiled_tests {
     use super::*;
     use crate::tiles::TILE;
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    fn synthetic_window(start: u64, len: usize) -> Arc<Shadow> {
+        let buffer = crate::tiles::reserved(len as u64).expect("reserved window");
+        // SAFETY: the resource is live.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len as u64);
+        shadow.window = true;
+        shadow.tiles = Some(crate::tiles::Tiles::new(len));
+        #[cfg(feature = "diagnostics")]
+        shadow.trace_window_backing();
+        Arc::new(shadow)
+    }
+
+    struct Title(*mut u8);
+
+    impl Title {
+        fn new(len: usize) -> Self {
+            // SAFETY: new private title stand-in.
+            let data = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+            assert!(!data.is_null() && data as usize % TILE == 0);
+            // SAFETY: the writable allocation is len bytes.
+            unsafe { std::ptr::write_bytes(data, 0x6a, len) };
+            Self(data)
+        }
+    }
+
+    impl Drop for Title {
+        fn drop(&mut self) {
+            // SAFETY: this owns the private allocation.
+            unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn overlapping_tiled_windows_keep_independent_gpu_writes_until_copy_back() {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+        let Some(host) = host() else { return };
+        let title = Title::new(3 * TILE);
+        let start = title.0 as usize;
+        let overlap = start + TILE;
+        let first = synthetic_window(start as u64, 2 * TILE);
+        let second = synthetic_window(overlap as u64, 2 * TILE);
+        assert_eq!(first.update(overlap, TILE), TILE);
+        assert_eq!(second.update(overlap, TILE), TILE);
+        assert_ne!(first.read_at(TILE), second.read_at(0), "distinct mapped backing slots");
+
+        let (source, cpu) = host.upload_buffer(256).expect("upload");
+        first.writing(overlap, 256);
+        // SAFETY: source is mapped for 256 bytes, the copy uses mapped tiles,
+        // and the explicit buffer transitions restore the common state.
+        unsafe {
+            std::ptr::write_bytes(cpu, 0xa7, 256);
+            let list = host.new_list().expect("copy list");
+            list.list.ResourceBarrier(&[crate::host::transition(&first.buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.list.CopyBufferRegion(&first.buffer, TILE as u64, &source, 0, 256);
+            list.list.ResourceBarrier(&[crate::host::transition(&first.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            list.close();
+            host.execute(&[&list]);
+        }
+
+        let read = |shadow: &Shadow, offset| host.copy_out_for_test(&shadow.buffer, offset, 256).expect("GPU read");
+        std::thread::scope(|scope| {
+            let copied = scope.spawn(|| read(&first, TILE as u64));
+            assert_eq!(read(&second, 0), vec![0x6a; 256]);
+            assert_eq!(copied.join().unwrap(), vec![0xa7; 256]);
+        });
+        assert_eq!(first.copy_back(overlap, 256), 256);
+        first.copy_back_done(&[(overlap, overlap + 256)]);
+        // A recording owner can outlive its lookup owner.
+        let replay_owner = first.clone();
+        drop(first);
+        assert_eq!(read(&replay_owner, TILE as u64), vec![0xa7; 256]);
+        drop(replay_owner);
+        assert_eq!(read(&second, 0), vec![0x6a; 256]);
+        assert_eq!(second.update(overlap, 256), 256);
+        assert_eq!(read(&second, 0), vec![0xa7; 256]);
+        assert!(host.device_alive());
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "isolated A/B fixture with 32 or 64 MiB of GPU tile backing"]
+    fn window_backing_read_only_ab() {
+        use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const SIZE: usize = 1 << 20;
+        const PAIRS: usize = 32;
+        let host = host().expect("hardware host");
+        let reuse = std::env::var_os("VICTORY_WINDOW_BACKING_FIXTURE").is_some_and(|s| s == "reuse");
+        let tracing = crate::allocation_telemetry::window_backing_enabled();
+        let title = Title::new(3 * SIZE * PAIRS);
+        let baseline_video = host.video_memory().expect("baseline DXGI segment counters");
+        let baseline_process = crate::copystat::process_memory();
+        let mut views = Vec::new();
+        let mut pages = Vec::new();
+        for i in 0..PAIRS {
+            let start = title.0 as usize + i * 3 * SIZE;
+            let first = synthetic_window((start + SIZE) as u64, 2 * SIZE);
+            assert_eq!(first.update(start + SIZE, SIZE), SIZE);
+            let second = synthetic_window(start as u64, 2 * SIZE);
+            let by_start = BTreeMap::from([
+                ((start as u64, (2 * SIZE) as u64), second.clone()),
+                (((start + SIZE) as u64, (2 * SIZE) as u64), first.clone()),
+            ]);
+            let from = (start + SIZE) as u64;
+            let to = from + SIZE as u64;
+            let baseline = holder(by_start.keys().copied(), from, to).expect("fully contained");
+            let pick = if reuse { geometry_holder(by_start.iter(), from, to).unwrap_or(baseline) } else { baseline };
+            let selected = &by_start[&pick];
+            assert_eq!(pick.0, if reuse { from } else { start as u64 });
+            assert!(geometry_holder(by_start.iter(), from - 1, to).is_none(), "one unmapped tile disqualifies the candidate");
+            assert_eq!(selected.update(start + SIZE, SIZE), SIZE);
+            for shadow in [&first, selected] {
+                let offset = shadow.offset((start + SIZE) as u64);
+                // A few bounded GPU reads exercise both view bindings.
+                let read = host.copy_out_for_test(&shadow.buffer, offset, 4096).expect("GPU read");
+                assert_eq!(read, vec![0x6a; 4096]);
+                for off in (0..SIZE).step_by(4096) {
+                    pages.push([shadow.read_at(offset as usize + off) as usize, 0usize]);
+                }
+            }
+            views.push((first, second));
+            if tracing && i % 8 == 7 {
+                std::thread::sleep(std::time::Duration::from_millis(225));
+            }
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        // SAFETY: own process, one native sizeof(two pointer words) record per valid address.
+        let ok = unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), pages.as_mut_ptr().cast(), (pages.len() * size_of::<[usize; 2]>()) as u32) };
+        assert_ne!(ok, 0, "working set query");
+        let resident_cpu_mapped = pages.iter().filter(|entry| entry[1] & 1 != 0).count() * 4096;
+        let mapped_capacity = pages.len() * 4096;
+        assert_eq!(mapped_capacity, PAIRS * SIZE * if reuse { 1 } else { 2 });
+        let live_video = host.video_memory().expect("live DXGI counters");
+        let live_process = crate::copystat::process_memory();
+        let tile_memory = crate::tiles::line();
+        eprintln!("window fixture reuse={reuse} mapped_bytes={mapped_capacity} resident_cpu_mapped_bytes={resident_cpu_mapped} tile_mib={tile_memory:?} baseline_dxgi={baseline_video:?} live_dxgi={live_video:?} baseline_process={baseline_process:?} live_process={live_process:?}");
+        assert!(host.device_alive());
+        if tracing {
+            while !views.is_empty() {
+                views.truncate(views.len().saturating_sub(8));
+                std::thread::sleep(std::time::Duration::from_millis(225));
+            }
+        } else {
+            drop(views);
+        }
+        assert_eq!(crate::tiles::line().0, 0);
+        assert_eq!(crate::tiles::line().1, 4, "at most one empty heap is retained");
+    }
 
     #[test]
     fn tiled_window_refresh_shader_writes_and_copy_back() {
