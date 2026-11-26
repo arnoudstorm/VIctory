@@ -1669,9 +1669,10 @@ mod tests {
             assert!(written.iter().any(|&(_, w)| w > before), "the write through B is seen: {written:?}");
             views_gone(a, 2 * K64);
             views_gone(b, 2 * K64);
-            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void });
-            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut c_void });
-            windows_sys::Win32::Foundation::CloseHandle(handle);
+            // The views stay mapped (128 KiB, until the test process ends):
+            // the write journal keeps its pages for good, and a later test
+            // given these addresses would find them written.
+            let _ = handle;
         }
     }
 }

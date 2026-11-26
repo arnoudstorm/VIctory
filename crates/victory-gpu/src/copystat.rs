@@ -192,7 +192,9 @@ pub(crate) enum C {
     WaitsForBuffers,
     IndirectBounded,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
+// Every counter has a place (Test #37 died on counter 80 of 80).
+const _: () = assert!((C::IndirectBounded as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {

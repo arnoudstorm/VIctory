@@ -320,14 +320,77 @@ with it before it can be a default.
 | #34 | same, compile gate 1,024 MiB, capture | **600 s cap** | world ~510 s; Lucia: hair streaks, black skin | **2.10** |
 | #35 | loop limit default (cold cache) | emergency stop, ~4.4 min | world's first frame, then black (shaders) | — |
 | #36 | `2ded7c88`, 2 pipeline workers | stopped by hand, 8.8 min | world: HUD and tip, 3D black (pipelines) | — |
-| #37 | `be1ca828`, alias guard, 8 workers, 20 min cap | running | | |
+| #37 | `be1ca828`, alias guard, 8 workers, 20 min cap | **panic** at 24 s (our counter overflow, fixed) | start screen (1 draw) | — |
+
+## Test #37 (`be1ca828`): the runtime panicked at 24 s
+
+The process ended by itself 24 s after start, on the start screen (1 draw,
+4.5 GB RAM, 6 GB available: not memory). Cause, from its log: `index out
+of bounds: the len is 80 but the index is 80` at `copystat.rs:1437`, the
+first copy-statistics line. The new `TexAliasQuiet` counter was the 81st
+of the counter enum, and the counter array holds `COUNTERS = 80`. The
+panic was in code that cannot unwind, so the process aborted. **A defect
+of ours in a diagnostics build**, not of the title nor of the alias guard
+itself. #37 is used up (the title had started); it measured nothing.
+
+Fix (this commit): `COUNTERS = 96`, and a compile-time check that the
+last counter has a place, so a new counter can no longer overflow it
+unnoticed. Why the suite did not find it: no test prints the copy
+statistics. The new real-view guard test also now leaves its two views
+mapped until the test process ends: the write journal keeps its pages for
+good, and the next test given those addresses found them written (two
+watch tests failed on the first suite run with the fix).
+
+## Audit of Tests #30-#37
+
+What is established, by run evidence:
+
+- **Loading.** The structurizer memo cap (`dc567b92`) took the loading
+  burst from ~1.6 GB to under 1 GB of translator memory (offline A/B,
+  identical output). Since it, every run reached the world's first frame
+  (#32-#36) but #37, which died of our own panic; #30 and #31, before it,
+  did not.
+- **The watchdog.** Requiring 2 s at or below 64 MiB, instead of one
+  sample, let #32 and #34 run to their caps through 9-10 recovered dips
+  each. It still stopped #35 (2 s at 0 MiB), as intended.
+- **Speed.** #34 is the best run so far: 2.10 fps in light scenes, 1.90
+  in heavy ones, CPU ~273 ms and GPU wait 160-194 ms a frame. Its
+  differences from #32/#33 (1.40-1.50 fps) are a warm cache and the
+  compile gate together; not split.
+- **Where frame time goes (#33, #36 counters).** Texture hashing ~100 ms
+  a frame, nearly all for aliased textures (113-134 MB a frame in #36);
+  copies ~150 ms; the submitting thread waits ~190 ms on its lock.
+- **Device removal.** One (#33), after 64 concurrent driver compiles
+  with RAM at 0. None since the compile gate (#34-#37), but #35-#37
+  were short; not proven gone.
+
+What is not established:
+
+- **Hair streaks and black skin (#34).** The suspect, the lowmem
+  preset's loop limit of 32, is untested: #35 and #36 removed it but
+  never drew the 3D world (a cold cache for that limit: memory in #35,
+  pipelines still being built in #36). About 1,136 of the ~3,200 shaders
+  are cached for the default limit now.
+- **Shared tiles' saving and correctness.** No off/on pair yet; #32's
+  139 MiB of independent tiles is not an A/B against #29's 579 MiB.
+- **The alias guard's effect.** Never ran in the title (#37 died first).
+  It must also pass the flicker audit's start-screen check before it can
+  be a default.
+- **Lighting.** Shadowed surfaces stay near black: the title's
+  ray-traced indirect light does not run; `VICTORY_AMBIENT` only lifts it.
+
+Settings state: everything new is opt-in (`VICTORY_SHARED_TILES`,
+`VICTORY_PIPELINE_WORKERS`, `VICTORY_ALIAS_GUARD`); the structurizer cap
+and the counter fix are not switches. The launcher's
+`CLAUDE_SHADER_LOOP_LIMIT` override is outside the repository
+(`work/run-laptop-card256.ps1`, original kept as `.bak-claude-t35`).
 
 ## Next
 
-1. Test #37: loop limit default with the cache now holding #35-#36's
-   translations, 8 workers, `VICTORY_ALIAS_GUARD=1`, more world frames
-   saved. Answers the hair and skin question if the world draws, and
-   measures the alias guard.
+1. The next run (#38, when launches resume): #37's settings with the
+   fixed build. Loop limit default (cache partly warm), 8 workers,
+   `VICTORY_ALIAS_GUARD=1`, more world frames saved: answers the hair
+   and skin question if the 3D world draws, and measures the alias guard.
 2. If the picture is still wrong: a run with `VICTORY_DUMP_TARGETS=1` on
    one Lucia frame, to find the pass.
 3. A shared-tiles off/on pair with capture (the 579 MiB claim, and
