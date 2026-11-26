@@ -354,7 +354,14 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
+            let previous_capacity = read.capacity();
             read.resize(size, 0);
+            if read.capacity() >= 8 << 20 {
+                tracing::info!(previous_capacity, capacity = read.capacity(),
+                    cpu_mapping = read.as_ptr() as usize,
+                    thread = ?std::thread::current().id(),
+                    "texture read scratch grew");
+            }
         }
         f(&mut read[..size])
     })

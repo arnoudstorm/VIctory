@@ -2982,9 +2982,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
+            // CPU address plus resource identity permits offline region-owner
+            // correlation. Size alone cannot identify a private allocation.
+            use windows::core::Interface;
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
                 len,
+                mapped_bytes = size,
+                cpu_mapping = data as usize,
+                resource = buffer.as_raw() as usize,
+                staging_resource = card.as_ref().map(|c| c.staging.as_raw() as usize),
+                gpu_address = gpu,
                 "large buffer copied to the host"
             );
         } else {

@@ -8310,7 +8310,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        let window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
@@ -8323,7 +8323,16 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        // Normal foreground request from the window's own thread. Windows may
+        // refuse it; never attach input queues or change foreground policy.
+        if std::env::var("VICTORY_FOCUS_ON_START").as_deref() == Ok("1") {
+            let _ = ShowWindow(window, SW_RESTORE);
+            let accepted = SetForegroundWindow(window).as_bool();
+            tracing::info!(accepted, foreground_matches = GetForegroundWindow() == window,
+                "startup foreground request");
+        }
+        Ok(window)
     }
 }
 
