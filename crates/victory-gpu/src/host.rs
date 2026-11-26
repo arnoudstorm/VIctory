@@ -7491,6 +7491,11 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let texture_bytes = crate::resource::texture_memory_totals();
+            tracing::info!(target: "victory_gpu::memory",
+                sampled = ?texture_bytes[0], depth = ?texture_bytes[1],
+                target = ?texture_bytes[2], uav = ?texture_bytes[3],
+                "default-heap texture accounting [current_bytes, peak_bytes, created, released]");
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

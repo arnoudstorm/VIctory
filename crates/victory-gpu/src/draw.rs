@@ -1603,7 +1603,9 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let mut room = crate::resource::room();
+        let recheck_room = crate::resource::background_reserve() != 0;
+        let mut attempted = 0usize;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
@@ -1749,6 +1751,9 @@ impl State {
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
+            if room && recheck_room && attempted != 0 && attempted % 8 == 0 {
+                room = crate::resource::room();
+            }
             if !room {
                 refused += 1;
                 if refused > 256 {
@@ -1756,6 +1761,7 @@ impl State {
                 }
                 continue;
             }
+            attempted += 1;
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {

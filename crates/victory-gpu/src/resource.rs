@@ -1195,6 +1195,7 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    memory_class: usize,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1461,7 +1462,28 @@ pub(crate) fn room() -> bool {
         std::env::var("VICTORY_TEXTURE_MIN_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
     });
     let pc = crate::host::available_physical_ram().map(|free| (free, min_free));
+    if !background_headroom(card, background_reserve()) {
+        return false;
+    }
     room_for(filled, limit, card, room_percent(), pc)
+}
+
+/// Leave room for essential allocations made outside the background pass.
+/// A missing budget preserves the existing fallback policy.
+#[cfg(windows)]
+pub(crate) fn background_reserve() -> u64 {
+    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVE.get_or_init(|| {
+        std::env::var("VICTORY_BACKGROUND_TEXTURE_RESERVE_MB")
+            .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(4096) << 20
+    })
+}
+
+#[cfg(windows)]
+fn background_headroom(card: Option<(u64, u64)>, reserve: u64) -> bool {
+    reserve == 0 || card.is_none_or(|(budget, used)| {
+        budget == 0 || budget.saturating_sub(used) > reserve
+    })
 }
 
 /// [`room`]'s decision: `filled` bytes of such copies, the byte `limit`
@@ -1497,7 +1519,18 @@ fn room_for(filled: u64, limit: Option<u64>, card: Option<(u64, u64)>, percent: 
 
 #[cfg(test)]
 mod room_tests {
-    use super::room_for;
+    use super::{background_headroom, room_for};
+
+    #[test]
+    fn background_reserve_responds_to_budget_shrink_and_recovery() {
+        let reserve = 512 << 20;
+        assert!(background_headroom(Some((7 * GB, 6 * GB)), reserve));
+        assert!(!background_headroom(Some((6 * GB + reserve, 6 * GB)), reserve));
+        assert!(!background_headroom(Some((6 * GB, 7 * GB)), reserve));
+        assert!(background_headroom(Some((7 * GB, 6 * GB)), reserve));
+        assert!(background_headroom(Some((6 * GB, 7 * GB)), 0));
+        assert!(background_headroom(None, reserve));
+    }
 
     const GB: u64 = 1 << 30;
 
@@ -1696,6 +1729,17 @@ pub(crate) fn census() -> [u64; 10] {
 pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+// DEFAULT heap textures tracked by HostTexture. Counts refer to wrappers,
+// not driver residency. Keep each allocation in exactly one class.
+#[cfg(windows)]
+static TEXTURE_MEMORY: [[std::sync::atomic::AtomicU64; 4]; 4] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 4];
+
+#[cfg(windows)]
+pub(crate) fn texture_memory_totals() -> [[u64; 4]; 4] {
+    TEXTURE_MEMORY.each_ref().map(|row| row.each_ref().map(|v| v.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
 /// The bytes the host allocates for `texture`.
 #[cfg(windows)]
 fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
@@ -1714,6 +1758,17 @@ impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
+        use windows::Win32::Graphics::Direct3D12::*;
+        // SAFETY: texture is a live D3D12 resource.
+        let flags = unsafe { texture.GetDesc() }.Flags;
+        let memory_class = if flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) { 1 }
+            else if flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) { 2 }
+            else if flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) { 3 }
+            else { 0 };
+        let [live, peak, created, _] = &TEXTURE_MEMORY[memory_class];
+        let now = live.fetch_add(bytes, Relaxed) + bytes;
+        peak.fetch_max(now, Relaxed);
+        created.fetch_add(1, Relaxed);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -1721,6 +1776,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            memory_class,
         }
     }
 }
@@ -1731,6 +1787,8 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        TEXTURE_MEMORY[self.memory_class][0].fetch_sub(self.bytes, Relaxed);
+        TEXTURE_MEMORY[self.memory_class][3].fetch_add(1, Relaxed);
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
