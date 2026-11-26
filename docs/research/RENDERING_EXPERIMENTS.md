@@ -254,3 +254,22 @@ stale data on screen.
   title makes the pipeline through 0x1f0 (`create_compute_x`); graphics
   pipelines are made on demand through `create_stream`. So they are not
   the cause of the black cloud blocks; the log text is corrected.
+
+## E22 (2026-11-26): `run-laptop.ps1 -Preset lowmem` (opt-in)
+
+- Change: 'low' with `VICTORY_TEXTURE_BUDGET_MB=768` (1024),
+  `VICTORY_TEXTURE_MIN_FREE_MB=3584`, `VICTORY_TEXTURE_STAGE_MB=16`,
+  `VICTORY_SHADER_LOOP_LIMIT=32` (64), `VICTORY_KEEP_SNAPSHOTS_MB=64` (256).
+- Actual, world medians from the overlay, against E21's `perf-run`:
+
+| Run | Frame | CPU | GPU wait | VRAM peak | RAM peak | Outcome |
+|---|---|---|---|---|---|---|
+| `perf-run` (low) | 717 ms | 251 ms | 405 ms | 6,445 / 5,734 MB | 11.7 GB | out of memory after ~105 s in the world |
+| `lowmem-run` | 718 ms | 313 ms | 332 ms | 6,137 / 5,720 MB | 13.3 GB | out of memory after ~150 s |
+| `restart-run` (lowmem) | 860 ms | 354 ms | 422 ms | 6,362 / 5,725 MB | 13.0 GB | still running at the 420 s cut (~110 s in the world) |
+
+- About 300 MB less card memory, no faster, and the run still goes over
+  the card's budget. The new loop limit made the first run translate its
+  shaders again (load ~4 min instead of ~1). Not a fix: the title's own
+  memory (TileHeap 3,977 MB, E19) plus ~3 GB of host copies do not fit
+  16 GB. Kept as an opt-in preset; 'low' stays the default.

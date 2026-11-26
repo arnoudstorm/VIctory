@@ -4,7 +4,7 @@
 param(
     [string]$GameDir,
     [string]$BuildPath,
-    [ValidateSet('auto', 'low', 'balanced', 'quality')]
+    [ValidateSet('auto', 'low', 'lowmem', 'balanced', 'quality')]
     [string]$Preset = 'auto',
     [switch]$Safe,
     [switch]$Bilinear,
@@ -78,6 +78,24 @@ $profile = switch ($Preset) {
             CompileHeadroomMB = '3072'
             PreludePool = '1'
             ShaderLoopLimit = '64'
+        }
+    }
+    'lowmem' {
+        # Opt-in, for 16 GB UMA laptops running out of memory in the world:
+        # 'low' with a smaller host texture budget, fewer kept snapshots and
+        # translated loops stopped sooner.
+        @{
+            Relay = '0'
+            Filter = 'bilinear'
+            TextureStageMB = '16'
+            TextureStageMS = '100'
+            TextureCatchup = '0'
+            TextureBudgetMB = '768'
+            TextureMinFreeMB = '3584'
+            CompileHeadroomMB = '3072'
+            PreludePool = '1'
+            ShaderLoopLimit = '32'
+            KeepSnapshotsMB = '64'
         }
     }
     'balanced' {
@@ -160,6 +178,9 @@ if ($CutsceneTest) {
     $settings.VICTORY_KEYS = (10..240 |
         Where-Object { $_ % 5 -eq 0 } |
         ForEach-Object { "${_}:Enter" }) -join ','
+}
+if ($profile.KeepSnapshotsMB) {
+    $settings.VICTORY_KEEP_SNAPSHOTS_MB = $profile.KeepSnapshotsMB
 }
 if ($GameDir) {
     $settings.VICTORY_GAME_DIR = $GameDir
