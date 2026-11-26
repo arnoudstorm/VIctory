@@ -227,6 +227,14 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let held: Vec<u64> = structure::HELD.iter().map(|h| h.load(Relaxed)).collect();
+        println!(
+            "structuring  {} lane-mask tables, largest {:.1} MiB; {} of 32 MiB or more, {:.0} MiB together",
+            held[0], held[1] as f64 / 1048576.0, held[2], held[3] as f64 / 1048576.0
+        );
+    }
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
