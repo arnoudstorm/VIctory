@@ -54,6 +54,11 @@ pub(crate) enum C {
     /// holding a host resource reference.
     DynamicReleased,
     DynamicRetained,
+    /// Unique resource identities in released ranges, those whose same-heap
+    /// slot owners all lie in the released range, and live weak shadow links.
+    DynamicUniqueResources,
+    DynamicHeapExclusiveResources,
+    DynamicLiveBackings,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1143,7 +1148,8 @@ pub(crate) fn log(frames: f64) {
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching, {:.0} released slots, {:.0} released slots still holding \
-         resources; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         resources, {:.0} unique resource refs ({:.0} exclusive to released slots in their heap), \
+         {:.0} live mapped backings; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1156,6 +1162,9 @@ pub(crate) fn log(frames: f64) {
         c[C::DynamicNs as usize] / 1e6,
         c[C::DynamicReleased as usize],
         c[C::DynamicRetained as usize],
+        c[C::DynamicUniqueResources as usize],
+        c[C::DynamicHeapExclusiveResources as usize],
+        c[C::DynamicLiveBackings as usize],
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],

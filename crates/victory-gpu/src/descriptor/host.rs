@@ -13,6 +13,19 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+#[cfg(feature = "diagnostics")]
+fn released_owner_summary(
+    released: &std::collections::HashMap<usize, u32>,
+    owners: &std::collections::HashMap<usize, u32>,
+) -> (u64, u64) {
+    let unique = released.len() as u64;
+    let heap_exclusive = released
+        .iter()
+        .filter(|(identity, count)| owners.get(identity).copied().unwrap_or(0) == **count)
+        .count() as u64;
+    (unique, heap_exclusive)
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -31,6 +44,11 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// Counts resource identities named by any slot in this heap. Diagnostics
+    /// use this to tell whether a released dynamic range was the heap's only
+    /// descriptor owner; it does not claim there are no non-descriptor owners.
+    #[cfg(feature = "diagnostics")]
+    resource_owners: Mutex<std::collections::HashMap<usize, u32>>,
     /// The host copy each buffer view's slot was made on
     /// (`VICTORY_SHARE_WINDOWS`): the copy the passes bring up to date for
     /// it ([`HostHeap::slot_copy`]), whatever another lookup finds since.
@@ -694,6 +712,8 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            #[cfg(feature = "diagnostics")]
+            resource_owners: Mutex::new(std::collections::HashMap::new()),
             made_on: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1163,14 +1183,39 @@ impl HostHeap {
             if given != 0 {
                 let first = at as usize + self.count as usize;
                 let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                let mut released = std::collections::HashMap::<usize, u32>::new();
                 let held = slots
                     .iter()
                     .enumerate()
                     .filter(|(_, taken)| **taken)
-                    .filter(|(offset, _)| kept.get(first + offset).is_some_and(Option::is_some))
+                    .filter_map(|(offset, _)| kept.get(first + offset).and_then(Option::as_ref))
+                    .map(|resource| {
+                        let identity = windows::core::Interface::as_raw(resource) as usize;
+                        *released.entry(identity).or_default() += 1;
+                        identity
+                    })
                     .count() as u64;
+                let (unique, exclusive) = {
+                    let owners = self.resource_owners.lock().unwrap_or_else(|e| e.into_inner());
+                    released_owner_summary(&released, &owners)
+                };
+                drop(kept);
+                let live_backings = {
+                    let made_on = self.made_on.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut unique = std::collections::HashSet::new();
+                    slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, taken)| **taken)
+                        .filter_map(|(offset, _)| made_on.get(first + offset).and_then(Option::as_ref))
+                        .filter(|weak| weak.strong_count() != 0 && unique.insert(weak.as_ptr() as usize))
+                        .count() as u64
+                };
                 crate::copystat::add(crate::copystat::C::DynamicReleased, u64::from(given));
                 crate::copystat::add(crate::copystat::C::DynamicRetained, held);
+                crate::copystat::add(crate::copystat::C::DynamicUniqueResources, unique);
+                crate::copystat::add(crate::copystat::C::DynamicHeapExclusiveResources, exclusive);
+                crate::copystat::add(crate::copystat::C::DynamicLiveBackings, live_backings);
             }
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
@@ -1210,7 +1255,27 @@ impl HostHeap {
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
             // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
+            #[cfg(feature = "diagnostics")]
+            let new_identity = resource
+                .as_ref()
+                .map(|resource| windows::core::Interface::as_raw(resource) as usize);
+            let old = std::mem::replace(slot, resource);
+            #[cfg(feature = "diagnostics")]
+            {
+                let mut owners = self.resource_owners.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(old_identity) = old.as_ref().map(|resource| windows::core::Interface::as_raw(resource) as usize) {
+                    if let Some(count) = owners.get_mut(&old_identity) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            owners.remove(&old_identity);
+                        }
+                    }
+                }
+                if let Some(identity) = new_identity {
+                    *owners.entry(identity).or_default() += 1;
+                }
+            }
+            if let Some(old) = old {
                 crate::host::retire(old);
             }
         }
@@ -2385,6 +2450,14 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn released_slot_owner_summary_counts_unique_and_heap_exclusive_resources() {
+        let released = std::collections::HashMap::from([(1, 2), (2, 1), (3, 1)]);
+        let owners = std::collections::HashMap::from([(1, 2), (2, 3), (3, 1), (4, 1)]);
+        assert_eq!(released_owner_summary(&released, &owners), (3, 2));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
