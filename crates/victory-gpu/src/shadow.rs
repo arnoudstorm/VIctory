@@ -2985,20 +2985,43 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// before execution. Prefer existing mapped backing only for these reads.
 pub(crate) fn find_geometry(address: u64, len: u64) -> Option<Arc<Shadow>> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if (2..=1 << 20).contains(&len)
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_GEOMETRY_WINDOWS").is_some_and(|v| v == "1"))
-        && fine()
-    {
-        lookup(address, len, WindowLookup::MappedGeometry)
-    } else {
-        find_any(address, len)
+    if !(2..=1 << 20).contains(&len) {
+        geometry_count(0, 1);
+        return find_any(address, len);
     }
+    if !fine() {
+        geometry_count(1, 1);
+        return find_any(address, len);
+    }
+    let enabled = *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_GEOMETRY_WINDOWS").is_some_and(|v| v == "1"));
+    lookup(address, len, if enabled { WindowLookup::MappedGeometry } else { WindowLookup::ObserveGeometry })
+}
+
+// Size, grid, registered buffer, no containing window, no containing tiled
+// window, tiled but not fully mapped, already selected, alternative without
+// a mapping benefit, eligible, activated, eligible missing bytes, activated
+// missing bytes. Byte totals are decisions, not unique physical savings.
+#[cfg(feature = "diagnostics")]
+static GEOMETRY: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+#[inline]
+fn geometry_count(_index: usize, _value: u64) {
+    #[cfg(feature = "diagnostics")]
+    if crate::allocation_telemetry::window_backing_enabled() {
+        GEOMETRY[_index].fetch_add(_value, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn geometry_opportunities() -> [u64; 12] {
+    GEOMETRY.each_ref().map(|v| v.load(Ordering::Relaxed))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowLookup {
     Exact,
     Any,
+    ObserveGeometry,
     MappedGeometry,
 }
 
@@ -3015,6 +3038,9 @@ fn lookup(address: u64, len: u64, mode: WindowLookup) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, mode);
     };
+    if matches!(mode, WindowLookup::ObserveGeometry | WindowLookup::MappedGeometry) {
+        geometry_count(2, 1);
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -3272,12 +3298,46 @@ fn loose(address: u64, end: u64, unsized_ask: bool, mode: WindowLookup) -> Optio
         // that begins in a cell below and reaches this far is passed over:
         // the ask then makes its own).
         let there = || map.range((cell, 0)..=(address, u64::MAX));
-        let mapped = if mode == WindowLookup::MappedGeometry {
+        #[cfg(feature = "diagnostics")]
+        let trace = matches!(mode, WindowLookup::ObserveGeometry | WindowLookup::MappedGeometry)
+            && crate::allocation_telemetry::window_backing_enabled();
+        #[cfg(not(feature = "diagnostics"))]
+        let trace = false;
+        let mapped = if mode == WindowLookup::MappedGeometry || trace {
             geometry_holder(there(), address, end)
         } else {
             None
         };
-        mapped.or_else(|| holder(there().map(|(key, _)| *key), address, end)).unwrap_or(named)
+        let baseline = holder(there().map(|(key, _)| *key), address, end);
+        if trace {
+            let reason = match (baseline, mapped) {
+                (None, _) => 3,
+                (Some(_), None) if there().any(|(&(start, bytes), s)| {
+                    start <= address && end <= start + bytes && s.tiles.is_some()
+                }) => 5,
+                (Some(_), None) => 4,
+                (Some(old), Some(new)) if old == new => 6,
+                (Some(old), Some(_)) => {
+                    if mode == WindowLookup::MappedGeometry {
+                        geometry_count(9, 1);
+                    }
+                    let missing = map[&old].tiles.as_ref().map_or(0, |tiles| {
+                        tiles.unmapped_bytes((address - old.0) as usize, (end - old.0) as usize)
+                    });
+                    if missing != 0 {
+                        geometry_count(10, missing);
+                        if mode == WindowLookup::MappedGeometry {
+                            geometry_count(11, missing);
+                        }
+                        8
+                    } else {
+                        7
+                    }
+                }
+            };
+            geometry_count(reason, 1);
+        }
+        if mode == WindowLookup::MappedGeometry { mapped.or(baseline) } else { baseline }.unwrap_or(named)
     } else {
         named
     };

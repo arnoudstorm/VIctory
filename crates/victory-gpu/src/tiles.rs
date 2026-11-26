@@ -268,6 +268,12 @@ impl Tiles {
                 .is_some_and(|tiles| tiles.iter().all(|tile| tile.load(Ordering::Acquire) != 0))
     }
 
+    pub(crate) fn unmapped_bytes(&self, from: usize, to: usize) -> u64 {
+        self.at.get(from / TILE..to.div_ceil(TILE)).map_or(0, |tiles| {
+            tiles.iter().filter(|tile| tile.load(Ordering::Acquire) == 0).count() as u64 * TILE as u64
+        })
+    }
+
     /// Where offset `off` of the window is, for writing: its tile mapped
     /// first if it is not (on `buffer`, the window's reserved buffer, on
     /// the host's queue, so ahead of every submission sent after). Null if

@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CAPACITY: usize = 1024;
+const CAPACITY: usize = 8192;
 const LARGE: u64 = 16 << 20;
 const PERIOD: Duration = Duration::from_millis(200);
 
@@ -235,13 +235,14 @@ fn sample(mut out: impl Write) -> std::io::Result<()> {
         let alive = crate::host::ALIVE.each_ref().map(|v| v.load(Relaxed));
         let made = crate::host::MADE.each_ref().map(|v| v.load(Relaxed));
         let pipeline = crate::pipeline::kept();
+        let geometry = crate::shadow::geometry_opportunities();
         let pipeline_workers = [
             PIPELINE_ACTIVE.load(Relaxed),
             PIPELINE_COMPLETED.load(Relaxed),
         ];
         writeln!(
             out,
-            "{{\"kind\":\"sample\",\"utc_us\":{},\"frame\":{},\"available_bytes\":{available},\"private_bytes\":{private},\"working_set_bytes\":{working},\"commit_left_bytes\":{commit_left},\"dxgi\":{dxgi},\"submissions_started\":{started_submissions},\"submissions_retired\":{retired},\"host_fence_completed\":{completed},\"texture_classes\":{textures:?},\"staging_bytes\":{staging},\"shadow_span_bytes\":{shadows},\"card_bytes\":{card:?},\"tile_mib\":[{},{},{}],\"host_alive\":{alive:?},\"host_attempts\":{made:?},\"pipeline_cache\":{pipeline:?},\"pipeline_workers\":{pipeline_workers:?},\"event_drops\":{}}}",
+            "{{\"kind\":\"sample\",\"utc_us\":{},\"frame\":{},\"available_bytes\":{available},\"private_bytes\":{private},\"working_set_bytes\":{working},\"commit_left_bytes\":{commit_left},\"dxgi\":{dxgi},\"submissions_started\":{started_submissions},\"submissions_retired\":{retired},\"host_fence_completed\":{completed},\"texture_classes\":{textures:?},\"staging_bytes\":{staging},\"shadow_span_bytes\":{shadows},\"card_bytes\":{card:?},\"tile_mib\":[{},{},{}],\"host_alive\":{alive:?},\"host_attempts\":{made:?},\"pipeline_cache\":{pipeline:?},\"pipeline_workers\":{pipeline_workers:?},\"geometry\":{geometry:?},\"event_drops\":{}}}",
             utc_us(),
             crate::frame::current(),
             tiles.0,
