@@ -104,6 +104,7 @@ struct DispatchUpscale {
 }
 
 const COLOUR: usize = 0;
+const MOTION: usize = 2;
 const OUTPUT: usize = 6;
 const NAMES: [&str; 7] = [
     "colour",
@@ -408,12 +409,21 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         once!(warn, "FidelityFX (ours): an upscaling without colour or output; nothing done");
         return PARAMETER;
     }
-    match victory_gpu::external::upscale(
+    let motion = victory_gpu::external::Motion {
+        texture: d.resources[MOTION].resource.cast::<Object>().cast_const(),
+        scale: [f32::from_bits(d.rest[2]), f32::from_bits(d.rest[3])],
+        reset: d.rest[12] != 0,
+    };
+    if n <= 3 {
+        tracing::info!(dispatch = n, scale = ?motion.scale, "FidelityFX (ours): motion-vector scale");
+    }
+    match victory_gpu::external::upscale_with(
         d.list.cast::<Object>().cast_const(),
         colour.cast::<Object>().cast_const(),
         output.cast::<Object>().cast_const(),
         render,
         size,
+        Some(motion),
     ) {
         Ok(()) => OK,
         Err(why) => {
