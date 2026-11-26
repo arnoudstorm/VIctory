@@ -1553,30 +1553,93 @@ mod fingerprint_bench_tests {
     #[ignore = "diagnostic microbenchmark; run alone with --nocapture"]
     fn shared_submission_fingerprint_cost() {
         const REPETITIONS: usize = 256;
+        const BATCHES: usize = 7;
+        const COLD_SAMPLES: usize = 9;
         let mut bytes = vec![0x5a; 128 << 10];
         let at = bytes.as_mut_ptr() as u64;
         let len = bytes.len() as u64;
         let expected = fingerprint(at, len);
-        let start = std::time::Instant::now();
-        for _ in 0..REPETITIONS {
-            assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
-            assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+        let mut duplicate_warm = Vec::new();
+        let mut shared_warm = Vec::new();
+        for batch in 0..BATCHES {
+            for shared_first in [batch % 2 == 0, batch % 2 != 0] {
+                let start = std::time::Instant::now();
+                if shared_first {
+                    for _ in 0..REPETITIONS {
+                        assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                    }
+                    shared_warm.push(start.elapsed());
+                    let start = std::time::Instant::now();
+                    for _ in 0..REPETITIONS {
+                        assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                        assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                    }
+                    duplicate_warm.push(start.elapsed());
+                } else {
+                    for _ in 0..REPETITIONS {
+                        assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                        assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                    }
+                    duplicate_warm.push(start.elapsed());
+                    let start = std::time::Instant::now();
+                    for _ in 0..REPETITIONS {
+                        assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                    }
+                    shared_warm.push(start.elapsed());
+                }
+            }
         }
-        let duplicate = start.elapsed();
-        let start = std::time::Instant::now();
-        for _ in 0..REPETITIONS {
-            assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+
+        fn median(values: &mut [u128]) -> u128 {
+            values.sort_unstable();
+            values[values.len() / 2]
         }
-        let shared = start.elapsed();
+        let mut evict = vec![0u8; 64 << 20];
+        let flush = |evict: &mut [u8]| {
+            for byte in evict.iter_mut().step_by(64) {
+                *byte = byte.wrapping_add(1);
+            }
+            std::hint::black_box(evict);
+        };
+        let mut duplicate_cold = Vec::new();
+        let mut shared_cold = Vec::new();
+        for sample in 0..COLD_SAMPLES {
+            let old = || {
+                let start = std::time::Instant::now();
+                assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                start.elapsed().as_nanos()
+            };
+            let new = || {
+                let start = std::time::Instant::now();
+                assert_eq!(std::hint::black_box(fingerprint(at, len)), expected);
+                start.elapsed().as_nanos()
+            };
+            if sample % 2 == 0 {
+                flush(&mut evict);
+                duplicate_cold.push(old());
+                flush(&mut evict);
+                shared_cold.push(new());
+            } else {
+                flush(&mut evict);
+                shared_cold.push(new());
+                flush(&mut evict);
+                duplicate_cold.push(old());
+            }
+        }
         let sampled_bytes = 3 * (16 << 10);
         eprintln!(
-            "fingerprint synthetic reps={REPETITIONS} sampled_bytes_each={sampled_bytes} old_calls={} old_bytes={} old_us={} shared_calls={} shared_bytes={} shared_us={}",
-            2 * REPETITIONS,
-            2 * REPETITIONS * sampled_bytes,
-            duplicate.as_micros(),
-            REPETITIONS,
-            REPETITIONS * sampled_bytes,
-            shared.as_micros(),
+            "fingerprint warm batches={BATCHES} reps_each={REPETITIONS} old_calls_per_rep=2 old_bytes_per_rep={} old_median_us_per_batch={} shared_calls_per_rep=1 shared_bytes_per_rep={sampled_bytes} shared_median_us_per_batch={}",
+            2 * sampled_bytes,
+            median(&mut duplicate_warm.iter().map(|d| d.as_micros()).collect::<Vec<_>>()),
+            median(&mut shared_warm.iter().map(|d| d.as_micros()).collect::<Vec<_>>()),
+        );
+        eprintln!(
+            "fingerprint cold-cache samples={COLD_SAMPLES} eviction_bytes={} old_median_ns={} shared_median_ns={} old_sample_bytes={} shared_sample_bytes={sampled_bytes}",
+            evict.len(),
+            median(&mut duplicate_cold),
+            median(&mut shared_cold),
+            2 * sampled_bytes,
         );
         std::hint::black_box(&mut bytes);
     }
