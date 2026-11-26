@@ -273,3 +273,18 @@ stale data on screen.
   shaders again (load ~4 min instead of ~1). Not a fix: the title's own
   memory (TileHeap 3,977 MB, E19) plus ~3 GB of host copies do not fit
   16 GB. Kept as an opt-in preset; 'low' stays the default.
+
+## E23 (2026-11-26): synthetic upload-before-alias regression and per-list source identity
+
+- Fixture: original packed UINT compute producer, UINT source SRV, aliased R9G9B9E5 SRV, two array layers and three mips. On the old implementation the producer's GPU readback matched but the placed SRV returned zero for expected `[1,1,12]` at mip 0/layer 0/texel 0, after a title-memory upload consumed the generic first-use marker. This is the expected negative control.
+- Fix: commit `559dc6101ab7513ffc81036298f86582bf339eab` tracks destination view → last GPU source in `Deferred`. Generic first-use remains for uploads. `texture::alias` now copies when the source identity is new, even if the source's first transition is deferred to the prelude. Existing state transitions still cause another copy after source use/write. Reset clears the tracking map.
+- Actual synthetic GPU test passed both default synchronous and `VICTORY_LATE_WAIT=1` submission paths on the available AMD adapter, with exact producer and placed-view readbacks across mips/layers, repeat reads, a second write epoch, reset, and a replacement source at the same title address. It did not release the old COM source before replacement, exhaustively test detach/replay, or establish the runtime sky binding.
+- Not a gameplay or visual-fix claim. Exact sky producer/view, descriptor retirement timing and current artifact frame remain unresolved. No title/game was launched.
+- Separate CPU diagnostics change in `f15aa66f0c33b9ec5f7f65adf777ef41c4108235` halves one repeated submission fingerprint in its diagnostic path; its isolated synthetic result is recorded in the performance report. `63a247a87af6d15840bbef15789d13cea3317b1d` adds counters only; descriptor owners are not released early.
+
+## E24 (2026-11-26): repeated warm and cache-evicted submission fingerprints
+
+- Test-only comparison: two stable fingerprint reads (the former submission observers) versus one shared read. Each sample used a 128 KiB private source; fingerprinting reads 48 KiB from it.
+- Seven alternating-order warm batches of 256 inputs: median 5.838 ms for 512 operations/24 MiB versus 2.880 ms for 256 operations/12 MiB. Operation and byte reductions are exact; timing applies to the synthetic hot-loop only.
+- Nine alternating-order cold-cache-approximation samples used a 64 MiB cache-thrashing sweep before each timed case: median 45.5 μs for two hashes/96 KiB versus 34.7 μs for one/48 KiB. This does not flush hardware caches. The old case's second read may be warm. Treat timing confidence as medium-low.
+- No title frame time, GPU time or system memory savings were measured. This test-only methodology commit is `015931ce14e7a2e457f946efcdf14c0d1b9b38ea`; the runtime behavior is unchanged from `f15aa66f`.

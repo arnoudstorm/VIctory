@@ -123,3 +123,7 @@ quality, not correctness of the rest of the frame.
 - What it shows: about 0.9 GB of GPU memory is duplicate window copies.
   A safe version needs every place that holds a window to go through
   one lookup, and merging only between frames, not on every ask.
+
+## 2026-11-26 implementation checkpoint
+
+No new failed optimization candidate. The pre-fix synthetic alias case was intentionally required to fail: producer bytes were correct while the placed SRV returned zeros. The source-tracking correction passed its synthetic test twice in separate synchronous/deferred queue configurations. Existing E17 window merging remains rejected and was not repeated. The shared fingerprint change measured an isolated microbenchmark only; no gameplay-frame gain is established. Descriptor instrumentation is observational and reports released dynamic slots that still own COM resources; it does not prove unique/sole ownership or physical reclamation. The new standard release candidate has not been launched. See the E23 implementation entry in `RENDERING_EXPERIMENTS.md` and the current queue in `NEXT_STEPS.md`.
