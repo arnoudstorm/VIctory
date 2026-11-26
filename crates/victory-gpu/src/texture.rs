@@ -391,6 +391,76 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
     })
 }
 
+/// Only owned copied bytes reach the callback. Direct reads keep their
+/// protection for their whole lifetime; no memory-stability check is skipped.
+fn with_stable_copy<R>(memory:*const u8,size:usize,guard:crate::watch::Reading,early:bool,f:impl FnOnce(&[u8])->R)->R{
+    with_read(size,|read|{
+        crate::host::copy_mapped(read.as_mut_ptr(),memory,size,false);
+        let held=if early{drop(guard);None}else{Some(guard)};
+        let result=f(read);drop(held);result
+    })
+}
+fn copied_unlock()->bool{
+    static ON:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *ON.get_or_init(||std::env::var_os("VICTORY_COPIED_READ_UNLOCK").is_some_and(|v|v=="1"))
+}
+#[cfg(test)]mod copied_lock_tests{
+    use super::*;
+    use windows_sys::Win32::System::Memory::*;
+    #[test]
+    fn owned_snapshot_survives_decommit_remap_and_gpu_fence(){
+        const SIZE:usize=65536;
+        // Synthetic private mapping, never title memory.
+        let memory=unsafe{VirtualAlloc(std::ptr::null(),SIZE,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE)};
+        assert!(!memory.is_null());unsafe{std::ptr::write_bytes(memory,0x39,SIZE)};
+        let reading=crate::watch::title_memory_reading();
+        let address=memory as usize;
+        let (sent,received)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move||{
+            let _changing=crate::watch::title_memory_remapping();
+            unsafe{
+                assert_ne!(VirtualFree(address as *mut _,SIZE,MEM_DECOMMIT),0);
+                assert_eq!(VirtualAlloc(address as *const _,SIZE,MEM_COMMIT,PAGE_READWRITE) as usize,address);
+                std::ptr::write_bytes(address as *mut u8,0x72,SIZE);
+            }
+            sent.send(()).unwrap();
+        });
+        with_stable_copy(memory.cast(),SIZE,reading,true,|copied|{
+            received.recv_timeout(std::time::Duration::from_secs(2)).expect("mapping must finish while callback uses owned copy");
+            assert!(copied.iter().all(|&v|v==0x39));
+            let host=host().expect("synthetic GPU device required");
+            let (buffer,data)=host.shared_buffer(SIZE as u64).unwrap();
+            unsafe{std::ptr::copy_nonoverlapping(copied.as_ptr(),data,SIZE)};
+            let returned=host.copy_out_for_test(&buffer,0,SIZE as u64).unwrap();
+            assert_eq!(returned,copied,"fence-completed GPU copy must retain original bytes");
+        });
+        worker.join().unwrap();
+        unsafe{assert_eq!(*(memory as *const u8),0x72);assert_ne!(VirtualFree(memory,0,MEM_RELEASE),0);}
+    }
+    #[test]
+    #[ignore="optimized remapper wait benchmark; --nocapture"]
+    fn copied_lock_scope_benchmark(){
+        let bytes=vec![0x42u8;65536];
+        for trial in 0..3{
+            for early in if trial%2==0{[false,true]}else{[true,false]}{
+                let reading=crate::watch::title_memory_reading();
+                let (tx,rx)=std::sync::mpsc::channel();
+                let worker=std::thread::spawn(move||{
+                    let began=std::time::Instant::now();tx.send(()).unwrap();
+                    let _guard=crate::watch::title_memory_remapping();began.elapsed().as_micros()
+                });
+                rx.recv().unwrap();
+                let began=std::time::Instant::now();
+                with_stable_copy(bytes.as_ptr(),bytes.len(),reading,early,|copy|{
+                    for _ in 0..1024{std::hint::black_box(blake3::hash(copy));}
+                });
+                let cpu=began.elapsed().as_micros();let wait=worker.join().unwrap();
+                eprintln!("copied lock trial={trial} early={early} callback_us={cpu} remapper_wait_us={wait} copy_bytes=65536 hash_bytes=67108864");
+            }
+        }
+    }
+}
+
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -775,8 +845,7 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let changed = with_stable_copy(self.memory,size,_mapped,copied_unlock(),|read| {
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -796,7 +865,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return with_stable_copy(self.memory,size,_mapped,copied_unlock(),|tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
