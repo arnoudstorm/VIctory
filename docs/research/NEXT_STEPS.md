@@ -147,3 +147,7 @@ Next work: establish actual safe physical headroom (normal optional-app Exit onl
 ### Mapped geometry candidate
 
 Use `VICTORY_WINDOW_BACKING_LOG=1` together with the allocation log for future authorized attribution. An exact result requires a complete trace with zero event loss. The analyzer is external at `work/analyze-window-backing.py`. Independently backed overlap, tile occupancy and Windows residency are separate. The tested selector is off by default. Keep Test #29 on hold until evidence supports sufficient real startup headroom. Avoid E17 rebinding and E18's broad descriptor reuse for this memory target.
+
+## Next authorized comparison
+
+Use the [Cycle V final handover](CYCLE_V_HANDOVER.md) as the baseline. Confirm eligibility and available headroom before reserving another runtime test.

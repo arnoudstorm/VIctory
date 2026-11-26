@@ -183,3 +183,7 @@ Serial workspace 576 passed, 0 failed, 26 ignored. GPU diagnostics 168 passed, 0
 Runtime commit `34d79c8abb2443a91cbbdbf8dd9fcda68e71dc72` adds opt-in backing identities and `VICTORY_MAPPED_GEOMETRY_WINDOWS=1`. It keeps existing descriptor, recorded-list and heap ownership, and restricts mapped-window preference to bounded sized vertex and index reads. Test #28 did not record per-title-address heap slots, so the independently backed share of its 892 MiB logical overlap cannot be recovered. Its 953 MiB of occupied tiles against 956 MiB of heap capacity indicates little free pool capacity at the final sample.
 
 Three matched synthetic pairs held the same 32 MiB of logical overlap and reduced occupied backing, heap capacity, resident CPU mappings and DXGI local growth from 64 to 32 MiB. Process private-commitment growth fell by 32.08–32.14 MiB. The copy-back and concurrent GPU-read fixtures passed. Test #29 was not launched. Real workload incidence and sufficient physical headroom remain open. Detailed report and raw fixture traces are in `C:\Users\Arnou\Documents\Codex\2026-11-25\ana\outputs\cycle5\`.
+
+## Cycle V final state
+
+Test #29 reached partial world preparation and ended on the emergency watchdog at 178.705 s. Test #30 was held after the 4.824 MiB minimum and zero eligible geometry requests. See [Cycle V final handover](CYCLE_V_HANDOVER.md) for exact build provenance, attribution, and hardware testing.
