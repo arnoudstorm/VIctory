@@ -116,11 +116,86 @@ Three runs of this configuration stopped before world preparation two times
 out of three. A fourth identical launch would repeat that gamble, so no
 further launch until the loading burst is reduced.
 
+## The loading burst: the shader structurizer (`dc567b92`)
+
+The 32 MiB+ Rust blocks logged during the loading burst (copystat
+backtraces, resolved against the build's PDB) are all
+`victory_shader::structure::Bools` tables: the `ite` memo had no bound and
+grew to 34-68 MiB per shader, while up to 8 pipeline workers structure
+shaders at once. In Test #31 about 440 MiB of such tables appeared within one
+second of the burst.
+
+Change (default on, not a switch): the memo is cleared at 2^18 entries (a
+pure cache; nodes stay canonical through `unique`), and `memo` and `unique`
+are let go once a `Structured` is built (nothing after building reads
+them). Test builds use a 64-entry memo, so every translator test runs with
+it constantly forgotten: 217 passed.
+
+Offline A/B, `victory translate shaders.rpf --jobs 8` (26,084 programs, the
+title's shader archive read locally, nothing kept):
+
+| | Baseline | Capped (run 1 / run 2) |
+|---|---:|---:|
+| Results (every count) | — | identical |
+| Peak private | 1,580 MiB | 970 / 914 MiB |
+| Largest table | 113.6 MiB | 61.5 MiB |
+| Table bytes allocated in total | 52.0 GB | 27.1 GB |
+| Time | 181 s | 172 / 174 s |
+
+The second baseline repeat was stopped for Test #32 and is missing. Side
+effect: the translator fingerprint changed, so Test #32 started with a cold
+shader cache (0 hits, 493+ misses, translation all through the world).
+
+## Watchdog: ordinary guard observation-only, emergency on sustained floors
+
+Tests #29-#31 were each stopped by the immediate `<=64 MiB` rule on a dip
+of under a second; their 100 ms samples show every earlier dip recovering
+(Test #29: 15 dips below 512 MiB, each gone within a second). The
+Cycle V observer (outside the repository, `outputs/cycle5/claude/`) now
+needs 2 s at or below 64 MiB, records every such dip, and keeps the other
+emergency rules: under 128 MiB for 8 s, commit at or below 256 MiB, a 2.5 s
+scheduling stall under 512 MiB, the manual stop file. Pagefile, memory
+compression and GPU timeout recovery untouched. The 2 s rule was reviewed
+and compiled, not exercised synthetically.
+
+## Test #32 (`dc567b92`, SHA-256 `451FE11A…7D1A`)
+
+Test #29's switches, plus `VICTORY_SHARED_TILES=1`, the capped structurizer,
+the observer above and per-thread samples. Cold shader cache.
+
+| Measurement | Result |
+|---|---|
+| Available at start | 8,697 MiB |
+| Termination | **600 s time cap** (no emergency, no device removal, 0 texture failures) |
+| Loading to first world frame | 187 s |
+| World rendering | **187-597 s (410 s)**; Cycle V record was 129 s |
+| Dips at or below 64 MiB | 10, all recovered, longest 1.8 s (lowest 0 MiB) |
+| Peak private / working set | 15.0 GB / 6.9 GB |
+| Heavy world frames (>=4,000 draws, n=51) | 1.40 fps; frame 696 / 843 / 2,014 ms (p50/p90/p99); CPU 377 ms, GPU wait 184 ms; 6,620 draws |
+| Light world frames (300-4,000 draws, n=208) | 1.40 fps; frame 716 / 903 / 1,979 ms; CPU 318 ms, GPU wait 205 ms; 1,080 draws |
+| Video memory late in the world | 7.3 GB used against a budget that fell to 6.6 GB |
+| Process CPU in the world | 9.3 of 16 logical cores (about eight threads near 0.8 each) |
+| Shared tiles | 3,160 MiB of window tile references on 1,351 MiB of physical tiles; 1,385 MB mapped onto another window's tile; 0 copy-on-write (no declared shader write reached a tiled window); 139 MiB still independently backed |
+
+Seen on screen (user report): the world, a character, the health bar, the
+tip message and sound; 3D elements visible, lighting only partly (the dark
+shadowed areas already listed in `GRAPHICS_CURRENT_STATE.md`). Earlier in
+the world the screen was black. Not checked frame by frame (capture was
+off), so no rendering-correctness claim for shared tiles yet.
+
+What it shows: memory pressure in loading and the world is spiky and
+recoverable; with dips allowed up to 2 s, the run lived to the cap. The
+577 MiB of overlap Test #29 had at world preparation is mostly avoided
+(Test #32: 139 MiB independently backed at the end), but Tests #29 and #32
+differ in more than shared tiles (structurizer, cold cache, observer), so
+this is not an A/B of the 579 MiB claim.
+
 ## Next
 
-1. The loading burst (E27's unattributed ~1.8 GB, here ~2 GB) decides
-   whether a run reaches world preparation at all; it is the first gate.
-2. Measure shared tiles over world preparation once a run reliably gets
-   there (Tests #30 and #31 did not).
-3. Only after a measured world-preparation result: consider shared tiles
-   for `run-laptop.ps1`; it stays off by default until then.
+1. Test #33: same configuration with a warm shader cache (Test #32 filled
+   it), and present/target capture on, to separate the CPU cost of
+   translation from the frame and to check the picture with shared tiles.
+2. A shared-tiles off/on pair with capture, for the 579 MiB A/B and for
+   rendering correctness, before shared tiles go into `run-laptop.ps1`.
+3. Lighting: shadowed surfaces near black (ambient/indirect), open since
+   25 November; video memory over its budget late in the world.
