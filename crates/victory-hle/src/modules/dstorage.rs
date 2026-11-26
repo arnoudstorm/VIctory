@@ -29,6 +29,8 @@ use victory_formats::bcpack::{self, Tables};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
+#[cfg(feature="diagnostics")]
+mod scratch_stats;
 
 /// CPU-only request scratch. Never backs GPU commands or escapes completion.
 /// Shared cap bounds retention across all worker threads, not per worker.
@@ -54,18 +56,37 @@ fn reuse_buffers() -> bool {
     static ON: OnceLock<bool>=OnceLock::new();
     *ON.get_or_init(||std::env::var_os("VICTORY_DSTORAGE_REUSE").is_some_and(|s|s=="1"))
 }
-struct WorkBuffer(Vec<u8>);
+struct WorkBuffer(Vec<u8>, #[cfg(feature="diagnostics")] Option<(usize,u64)>);
 impl WorkBuffer {
-    fn new(size:usize)->Self {
-        if reuse_buffers(){
-            let mut bytes=BUFFERS.lock().unwrap_or_else(|e|e.into_inner()).take(size);
-            bytes.resize(size,0);Self(bytes)
-        }else{Self(vec![0;size])}
+    fn new(size:usize,_role:usize)->Self {
+        #[cfg(feature="diagnostics")]
+        let tracked=scratch_stats::enabled();
+        #[cfg(feature="diagnostics")]
+        let began=tracked.then(std::time::Instant::now);
+        let pooling=reuse_buffers();
+        let (mut bytes,reused)=if pooling{
+            let bytes=BUFFERS.lock().unwrap_or_else(|e|e.into_inner()).take(size);
+            let reused=bytes.capacity()>=size && bytes.capacity()!=0;
+            // The mutex temporary is gone before allocating/initializing.
+            (bytes,reused)
+        }else{(vec![0;size],false)};
+        #[cfg(feature="diagnostics")]
+        let wait_ns=if pooling{began.map(|s|s.elapsed().as_nanos() as u64).unwrap_or(0)}else{0};
+        #[cfg(not(feature="diagnostics"))]
+        let _=reused;
+        bytes.resize(size,0);
+        #[cfg(feature="diagnostics")]
+        let observed=tracked.then(||{scratch_stats::acquire(_role,size,bytes.capacity(),reused,wait_ns);(_role,bytes.capacity() as u64)});
+        Self(bytes,#[cfg(feature="diagnostics")] observed)
     }
 }
 impl std::ops::Deref for WorkBuffer {type Target=[u8];fn deref(&self)->&[u8]{&self.0}}
 impl std::ops::DerefMut for WorkBuffer {fn deref_mut(&mut self)->&mut [u8]{&mut self.0}}
-impl Drop for WorkBuffer {fn drop(&mut self){if reuse_buffers(){BUFFERS.lock().unwrap_or_else(|e|e.into_inner()).put(std::mem::take(&mut self.0));}}}
+impl Drop for WorkBuffer {fn drop(&mut self){
+    #[cfg(feature="diagnostics")]
+    if let Some((role,capacity))=self.1{scratch_stats::release(role,capacity);}
+    if reuse_buffers(){BUFFERS.lock().unwrap_or_else(|e|e.into_inner()).put(std::mem::take(&mut self.0));}
+}}
 enum Source { Borrowed(&'static [u8]), Owned(WorkBuffer) }
 impl std::ops::Deref for Source {type Target=[u8];fn deref(&self)->&[u8]{match self{Self::Borrowed(b)=>b,Self::Owned(b)=>b}}}
 
@@ -859,7 +880,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = WorkBuffer::new(request.intermediate_size as usize);
+        let mut packed = WorkBuffer::new(request.intermediate_size as usize,1);
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.0.truncate(n);
         Source::Owned(packed)
@@ -977,7 +998,7 @@ fn read_source(request: &Request) -> Result<Source, HRESULT> {
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Source::Borrowed(bytes));
     }
-    let mut bytes = WorkBuffer::new(size);
+    let mut bytes = WorkBuffer::new(size,0);
     read_into(request, &mut bytes)?;
     Ok(Source::Owned(bytes))
 }
@@ -1045,7 +1066,7 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = WorkBuffer::new(len);
+    let mut data = WorkBuffer::new(len,2);
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
