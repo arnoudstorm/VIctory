@@ -485,6 +485,9 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+#[cfg(feature = "diagnostics")]
+pub(crate) static DETACHED_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The process's private bytes (diagnostics: around the making of lists).
 #[cfg(feature = "diagnostics")]
 fn private_bytes() -> u64 {
@@ -804,7 +807,7 @@ fn lazy_lists() -> bool {
 /// closing, resetting and submitting, where a list never opened stays as
 /// it was made: closed and empty.
 pub(crate) struct LazyList {
-    list: ID3D12GraphicsCommandList,
+    list: OnceLock<ID3D12GraphicsCommandList>,
     allocator: ID3D12CommandAllocator,
     /// Made closed and not opened since.
     unopened: std::sync::atomic::AtomicBool,
@@ -813,7 +816,15 @@ pub(crate) struct LazyList {
 impl LazyList {
     /// The list as it is, without opening it.
     pub(crate) fn raw(&self) -> &ID3D12GraphicsCommandList {
-        &self.list
+        self.list.get_or_init(|| {
+            let host = host().expect("host owning the lazy list");
+            // SAFETY: creating a closed list does not touch command memory.
+            unsafe {
+                host.device.cast::<ID3D12Device4>()
+                    .and_then(|device| device.CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE))
+                    .unwrap_or_else(|e| fail(format_args!("deferred host list creation failed ({e})")))
+            }
+        })
     }
 
     /// Whether the list was never opened (made closed and empty).
@@ -834,11 +845,11 @@ impl std::ops::Deref for LazyList {
             LAZY_OPENED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: a closed list made by `CreateCommandList1`, never
             // submitted; its allocator holds nothing.
-            if let Err(e) = unsafe { self.list.Reset(&self.allocator, None) } {
+            if let Err(e) = unsafe { self.raw().Reset(&self.allocator, None) } {
                 fail(format_args!("a host command list made closed did not open ({e})"));
             }
         }
-        &self.list
+        self.raw()
     }
 }
 
@@ -1401,6 +1412,8 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 /// One in [`ALIVE`]`[0]` while it lives (a host list), and one in
 /// [`LISTS`]`[3]` until it is first reset.
 struct Counted {
+    #[cfg(feature = "diagnostics")]
+    detached: std::sync::atomic::AtomicBool,
     /// Not reset since it was made.
     fresh: std::sync::atomic::AtomicBool,
 }
@@ -1410,6 +1423,8 @@ impl Counted {
         ALIVE[0].fetch_add(1, Ordering::Relaxed);
         LISTS[3].fetch_add(1, Ordering::Relaxed);
         Counted {
+            #[cfg(feature = "diagnostics")]
+            detached: std::sync::atomic::AtomicBool::new(false),
             fresh: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -1424,6 +1439,10 @@ impl Counted {
 
 impl Drop for Counted {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if self.detached.load(Ordering::Relaxed) {
+            DETACHED_LISTS.fetch_sub(1, Ordering::Relaxed);
+        }
         ALIVE[0].fetch_sub(1, Ordering::Relaxed);
         self.used();
     }
@@ -3107,13 +3126,13 @@ mod lazy_list_tests {
         unsafe {
             let allocator: ID3D12CommandAllocator =
                 host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
-            let list = host
+            let list: ID3D12GraphicsCommandList = host
                 .device
                 .cast::<ID3D12Device4>()
                 .expect("device 4")
                 .CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE)
                 .expect("closed list");
-            LazyList { list, allocator, unopened: std::sync::atomic::AtomicBool::new(true) }
+            LazyList { list: OnceLock::from(list), allocator, unopened: std::sync::atomic::AtomicBool::new(true) }
         }
     }
 
@@ -3160,6 +3179,56 @@ mod lazy_list_tests {
         assert!(copied.iter().all(|&b| b == 0x5a), "the copy recorded after opening did not run");
     }
 
+    #[test]
+    fn deferred_list_object_records_replays_and_resets() {
+        let Some(host) = super::host() else { return };
+        // SAFETY: an independent allocator, never submitted yet.
+        let allocator = unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.expect("allocator");
+        let list = LazyList { list: OnceLock::new(), allocator, unopened: std::sync::atomic::AtomicBool::new(true) };
+        assert!(list.list.get().is_none());
+        let (src, source) = host.shared_buffer(65536).expect("source");
+        let (dst, destination) = host.shared_buffer(65536).expect("destination");
+        for epoch in [0x35u8, 0x9c] {
+            // SAFETY: mapped 64 KiB buffers; every prior submission was waited for.
+            unsafe {
+                std::ptr::write_bytes(source, epoch, 4096);
+                list.CopyBufferRegion(&dst, 0, &src, 0, 4096);
+                list.raw().Close().expect("close");
+            }
+            assert!(list.list.get().is_some());
+            for _ in 0..2 {
+                // SAFETY: previous execution finished; test replay must recopy.
+                unsafe { std::ptr::write_bytes(destination, 0, 4096) };
+                run(host, list.raw());
+                // SAFETY: mapped buffer after fence completion.
+                assert!(unsafe { std::slice::from_raw_parts(destination, 4096) }.iter().all(|&b| b == epoch));
+            }
+            // SAFETY: both replays have completed their hardware fence.
+            unsafe {
+                list.allocator.Reset().expect("allocator reset");
+                list.raw().Reset(&list.allocator, None).expect("list reset");
+            }
+        }
+        // SAFETY: the final reset opened an empty list.
+        unsafe { list.raw().Close().expect("close final") };
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn detached_owner_count_clears_on_completed_reset_and_drop() {
+        let Some(host) = super::host() else { return };
+        let before = DETACHED_LISTS.load(Ordering::Relaxed);
+        let list = host.new_list().expect("list");
+        list.close();
+        let list = list.detached();
+        assert_eq!(DETACHED_LISTS.load(Ordering::Relaxed), before + 1);
+        list.reset(); // no submission was made; allocator is safe to reset.
+        assert_eq!(DETACHED_LISTS.load(Ordering::Relaxed), before);
+        list.close();
+        drop(list.detached());
+        assert_eq!(DETACHED_LISTS.load(Ordering::Relaxed), before);
+    }
+
     /// The process memory of 64 lazy lists before and after their first
     /// command (printed for the record).
     #[test]
@@ -3185,6 +3254,48 @@ mod lazy_list_tests {
             (opened >> 10) / 64
         );
         assert!(made < opened);
+    }
+
+    /// Process deltas are observations, not exclusive driver attribution.
+    #[test]
+    #[ignore = "isolated allocation measurement; run serially with --nocapture"]
+    fn unopened_allocator_and_list_costs() {
+        let Some(host) = super::host() else { return };
+        let before = process_private_bytes();
+        let began = std::time::Instant::now();
+        // SAFETY: independent command allocators; no GPU work is submitted.
+        let allocators: Vec<ID3D12CommandAllocator> = (0..64)
+            .map(|_| unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.expect("allocator"))
+            .collect();
+        let allocator_us = began.elapsed().as_micros();
+        let after_allocators = process_private_bytes();
+        let began = std::time::Instant::now();
+        let device: ID3D12Device4 = host.device.cast().expect("device4");
+        // SAFETY: unopened lists do not refer to any allocator.
+        let lists: Vec<ID3D12GraphicsCommandList> = (0..64)
+            .map(|_| unsafe { device.CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE) }.expect("closed list"))
+            .collect();
+        let list_us = began.elapsed().as_micros();
+        let after_lists = process_private_bytes();
+        eprintln!("unopened object fixture: 64 allocators delta={} bytes time={allocator_us} us; 64 closed lists delta={} bytes time={list_us} us",
+            after_allocators as i128 - before as i128, after_lists as i128 - after_allocators as i128);
+        drop(lists);
+        drop(allocators);
+    }
+
+    #[test]
+    #[ignore = "process memory benchmark; run alone in alternating configurations"]
+    fn deferred_list_object_allocation_cost() {
+        let Some(host) = super::host() else { return };
+        let before = process_private_bytes();
+        let began = std::time::Instant::now();
+        let lists: Vec<_> = (0..64).map(|_| host.make_list().expect("list")).collect();
+        let us = began.elapsed().as_micros();
+        let bytes = process_private_bytes() as i128 - before as i128;
+        let objects = lists.iter().filter(|list| list.list.list.get().is_some()).count();
+        for list in &lists { list.close(); }
+        eprintln!("64 production unopened lists: private_delta={bytes} bytes creation={us} us objects={objects}");
+        drop(lists);
     }
 }
 
@@ -3877,6 +3988,8 @@ impl Host {
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
+        crate::copystat::start_allocation_sampler();
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
@@ -3926,17 +4039,20 @@ impl Host {
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
             let lazy = lazy_lists();
-            let list: ID3D12GraphicsCommandList = if lazy {
-                self.device.cast::<ID3D12Device4>()?.CreateCommandList1(
+            let deferred_object = lazy && std::env::var_os("VICTORY_LAZY_LIST_OBJECTS").is_some_and(|v| v == "1");
+            let object: Option<ID3D12GraphicsCommandList> = if deferred_object {
+                None
+            } else if lazy {
+                Some(self.device.cast::<ID3D12Device4>()?.CreateCommandList1(
                     0,
                     D3D12_COMMAND_LIST_TYPE_DIRECT,
                     D3D12_COMMAND_LIST_FLAG_NONE,
-                )?
+                )?)
             } else {
-                self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?
+                Some(self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?)
             };
             let list = LazyList {
-                list,
+                list: object.map(OnceLock::from).unwrap_or_default(),
                 allocator: allocator.clone(),
                 unopened: std::sync::atomic::AtomicBool::new(lazy),
             };
@@ -5544,6 +5660,14 @@ impl Host {
 }
 
 impl HostList {
+    /// Ownership label only; does not change resource or fence lifetime.
+    pub(crate) fn detached(self) -> Self {
+        #[cfg(feature = "diagnostics")]
+        if !self._alive.detached.swap(true, Ordering::Relaxed) {
+            DETACHED_LISTS.fetch_add(1, Ordering::Relaxed);
+        }
+        self
+    }
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -5646,6 +5770,10 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        if self._alive.detached.swap(false, Ordering::Relaxed) {
+            DETACHED_LISTS.fetch_sub(1, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();

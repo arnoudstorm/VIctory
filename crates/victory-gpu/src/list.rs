@@ -224,6 +224,13 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (128, 256 << 20);
 
+/// Completed lists in the reusable pool, not title-owned replay recordings.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pool_memory() -> (usize, u64) {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    (idle.0.len(), idle.1)
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -410,7 +417,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 (
                     part.waits,
                     Detached {
-                        host: part.host,
+                        host: part.host.detached(),
                         _uploads: Vec::new(),
                         _state: Default::default(),
                     },
@@ -420,7 +427,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         pieces.push((
             gate,
             Detached {
-                host,
+                host: host.detached(),
                 _uploads: uploads,
                 _state: state,
             },
@@ -482,7 +489,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         taken.push((
             this,
             Detached {
-                host,
+                host: host.detached(),
                 _uploads: uploads,
                 _state: state,
             },

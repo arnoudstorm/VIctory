@@ -7,6 +7,43 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+/// Optional persistent sampler independent of presents and category-map walks.
+/// No heap/descriptor/driver locks: this must remain useful during startup.
+pub(crate) fn start_allocation_sampler() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        let Some(path) = std::env::var_os("VICTORY_ALLOCATION_LOG") else { return };
+        let _ = std::thread::Builder::new().name("allocation-samples".into()).spawn(move || {
+            use std::io::Write;
+            let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+            let began = std::time::Instant::now();
+            loop {
+                let (working, private) = process_memory();
+                let (available, commit_left) = system_memory();
+                let alive: Vec<u64> = crate::host::ALIVE.iter().map(|v| v.load(Relaxed)).collect();
+                let lists: Vec<u64> = crate::host::LISTS.iter().map(|v| v.load(Relaxed)).collect();
+                let detached = crate::host::DETACHED_LISTS.load(Relaxed);
+                let lazy_opens = crate::host::LAZY_OPENED.load(Relaxed);
+                let utc_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                if writeln!(file, "{{\"utc_ms\":{utc_ms},\"elapsed_ms\":{},\"private_bytes\":{private},\"working_set_bytes\":{working},\"available_bytes\":{available},\"commit_left_bytes\":{commit_left},\"detached_lists\":{detached},\"lazy_opens_cumulative\":{lazy_opens},\"alive\":{alive:?},\"lists\":{lists:?}}}", began.elapsed().as_millis()).is_err() { return }
+                if file.flush().is_err() { return }
+                std::thread::sleep(std::time::Duration::from_millis(allocation_sample_ms(available)));
+            }
+        });
+    });
+}
+
+fn allocation_sample_ms(available: u64) -> u64 {
+    if available < 1024 * 1024 * 1024 { 250 } else { 1000 }
+}
+
+#[test]
+fn allocation_sampler_increases_frequency_near_guardrail() {
+    assert_eq!(allocation_sample_ms(2 << 30), 1000);
+    assert_eq!(allocation_sample_ms(512 << 20), 250);
+    assert_eq!(allocation_sample_ms(256 << 20), 250);
+}
+
 /// Counters since the last line.
 pub(crate) enum C {
     Submissions,
@@ -718,6 +755,14 @@ fn log_memory() {
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
     let (free, left) = system_memory();
+    let (pooled, scratch) = crate::list::pool_memory();
+    tracing::info!(
+        pooled_lists = pooled,
+        pooled_scratch_bytes = scratch,
+        detached_lists = crate::host::DETACHED_LISTS.load(Relaxed),
+        lazy_opens_since_start = crate::host::LAZY_OPENED.load(Relaxed),
+        "command-list ownership snapshot (pool contains completed/reset lists only; other owners not inferred)"
+    );
     let copies = crate::shadow::memory();
     let staged = crate::texture::memory();
     let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
