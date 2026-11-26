@@ -193,7 +193,11 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
     let file = path.rsplit('\\').next()?;
     let address = crate::registry::lookup(file, &symbol);
     #[cfg(all(windows, feature = "diagnostics"))]
-    let address = address.or_else(|| crate::memory_events::wrap(file, &symbol));
+    let address = address.or_else(|| {
+        let observer = crate::memory_events::wrap(file, &symbol)?;
+        // Observing a lookup must not invent an export absent from this DLL.
+        (!host::get_proc_address(module,name).is_null()).then_some(observer)
+    });
     address.map(|address| address as *mut c_void)
 }
 
@@ -598,6 +602,20 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn memory_observation_keeps_dynamic_export_availability() {
+        for dll in [c"kernel32.dll",c"ntdll.dll"] {
+            let module=host::get_module_handle_a(dll.as_ptr().cast());
+            assert!(!module.is_null());
+            for symbol in [c"VirtualAlloc",c"VirtualAlloc2",c"RtlAllocateHeap",c"HeapReAlloc"] {
+                let native=host::get_proc_address(module,symbol.as_ptr().cast());
+                let observed=GetProcAddress(module,symbol.as_ptr().cast());
+                assert_eq!(native.is_null(),observed.is_null(),"availability changed for {dll:?} {symbol:?}");
+            }
+        }
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
