@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -30,6 +29,45 @@ use victory_formats::bcpack::{self, Tables};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
+
+/// CPU-only request scratch. Never backs GPU commands or escapes completion.
+/// Shared cap bounds retention across all worker threads, not per worker.
+#[derive(Default)]
+struct BufferPool { buffers: Vec<Vec<u8>>, retained: usize, allocations: u64, allocated_bytes: u64 }
+impl BufferPool {
+    const MAX_BUFFER: usize = 4 << 20;
+    const MAX_TOTAL: usize = 16 << 20;
+    fn take(&mut self, size: usize) -> Vec<u8> {
+        let at=self.buffers.iter().enumerate().filter(|(_,b)|b.capacity()>=size).min_by_key(|(_,b)|b.capacity()).map(|(i,_)|i);
+        if let Some(at)=at {let b=self.buffers.swap_remove(at);self.retained-=b.capacity();b} else {
+            self.allocations+=1;self.allocated_bytes+=size as u64;Vec::new()
+        }
+    }
+    fn put(&mut self, mut bytes: Vec<u8>) {
+        let cap=bytes.capacity();
+        if cap==0 || cap>Self::MAX_BUFFER || self.buffers.len()>=16 || self.retained+cap>Self::MAX_TOTAL {return}
+        bytes.clear();self.retained+=cap;self.buffers.push(bytes);
+    }
+}
+static BUFFERS: Mutex<BufferPool> = Mutex::new(BufferPool {buffers:Vec::new(),retained:0,allocations:0,allocated_bytes:0});
+fn reuse_buffers() -> bool {
+    static ON: OnceLock<bool>=OnceLock::new();
+    *ON.get_or_init(||std::env::var_os("VICTORY_DSTORAGE_REUSE").is_some_and(|s|s=="1"))
+}
+struct WorkBuffer(Vec<u8>);
+impl WorkBuffer {
+    fn new(size:usize)->Self {
+        if reuse_buffers(){
+            let mut bytes=BUFFERS.lock().unwrap_or_else(|e|e.into_inner()).take(size);
+            bytes.resize(size,0);Self(bytes)
+        }else{Self(vec![0;size])}
+    }
+}
+impl std::ops::Deref for WorkBuffer {type Target=[u8];fn deref(&self)->&[u8]{&self.0}}
+impl std::ops::DerefMut for WorkBuffer {fn deref_mut(&mut self)->&mut [u8]{&mut self.0}}
+impl Drop for WorkBuffer {fn drop(&mut self){if reuse_buffers(){BUFFERS.lock().unwrap_or_else(|e|e.into_inner()).put(std::mem::take(&mut self.0));}}}
+enum Source { Borrowed(&'static [u8]), Owned(WorkBuffer) }
+impl std::ops::Deref for Source {type Target=[u8];fn deref(&self)->&[u8]{match self{Self::Borrowed(b)=>b,Self::Owned(b)=>b}}}
 
 /// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
@@ -821,10 +859,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = WorkBuffer::new(request.intermediate_size as usize);
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        packed.0.truncate(n);
+        Source::Owned(packed)
     } else {
         source
     };
@@ -932,16 +970,16 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request) -> Result<Source, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(Source::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = WorkBuffer::new(size);
     read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    Ok(Source::Owned(bytes))
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1007,7 +1045,7 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
+    let mut data = WorkBuffer::new(len);
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
@@ -1078,6 +1116,41 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn scratch_pool_is_bounded_zeroed_and_never_shares_live_buffers() {
+        let mut pool=BufferPool::default();
+        let mut a=pool.take(65536);a.resize(65536,0);a.fill(0xab);
+        let mut b=pool.take(65536);b.resize(65536,0);
+        assert_ne!(a.as_ptr(),b.as_ptr());
+        pool.put(a);let mut reused=pool.take(32768);reused.resize(32768,0);
+        assert!(reused.iter().all(|&v|v==0));pool.put(reused);pool.put(b);
+        pool.put(vec![0;BufferPool::MAX_BUFFER+1]);
+        for _ in 0..32 {pool.put(vec![0;2<<20]);}
+        assert!(pool.retained<=BufferPool::MAX_TOTAL);assert!(pool.buffers.len()<=16);
+    }
+
+    #[test]
+    #[ignore="isolated allocation-volume benchmark; --nocapture"]
+    fn bounded_scratch_reuse_cost() {
+        for trial in 0..3 {
+            let sizes=[65536usize,131072,262144,131072];
+            let pool=Mutex::new(BufferPool::default());
+            let mut old_us=0;let mut new_us=0;let mut requested=0usize;
+            for mode in if trial%2==0 {[false,true]}else{[true,false]} {
+                let began=Instant::now();
+                for i in 0..2048 {
+                    let size=sizes[i%sizes.len()];
+                    if mode {let mut data=pool.lock().unwrap().take(size);data.resize(size,0);std::hint::black_box(&mut data);pool.lock().unwrap().put(data);}
+                    else {let mut data=vec![0u8;size];std::hint::black_box(&mut data);requested+=size;}
+                }
+                if mode{new_us=began.elapsed().as_micros()}else{old_us=began.elapsed().as_micros()}
+            }
+            let pool=pool.lock().unwrap();
+            eprintln!("scratch trial={trial} baseline_allocations=2048 baseline_requested={requested} pool_allocations={} pool_requested={} retained={} baseline_us={old_us} reused_us={new_us}",pool.allocations,pool.allocated_bytes,pool.retained);
+            assert!(pool.allocations<8);assert!(pool.allocated_bytes<(requested/100) as u64);assert!(pool.retained<=BufferPool::MAX_TOTAL);
+        }
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
