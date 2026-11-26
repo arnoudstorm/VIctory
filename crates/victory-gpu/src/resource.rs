@@ -2460,6 +2460,11 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    mod alias_fixture {
+        include!("alias_fixture.rs");
+    }
+
     use super::*;
     use crate::object::slot;
 
