@@ -394,8 +394,7 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// Only owned copied bytes reach the callback. Direct reads keep their
 /// protection for their whole lifetime; no memory-stability check is skipped.
 fn with_stable_copy<R>(memory:*const u8,size:usize,guard:crate::watch::Reading,early:bool,f:impl FnOnce(&[u8])->R)->R{
-    with_read(size,|read|{
-        crate::host::copy_mapped(read.as_mut_ptr(),memory,size,false);
+    with_title(memory,size,|read|{
         let held=if early{drop(guard);None}else{Some(guard)};
         let result=f(read);drop(held);result
     })
