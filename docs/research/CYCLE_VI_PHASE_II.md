@@ -132,6 +132,35 @@ memory was being compressed and paged back in, so its audio thread stalled on
 missing pages and its buffers ran dry; at 1–2 fps the emulated title also
 falls behind its own audio schedule. No audio warning or error was logged.
 
+### Test #51: draws bound for new texture copies (b29cec77)
+
+b29cec77 makes a draw leave a texture the title fills waiting, instead of
+making its host copy, while the card is at or past its budget or the PC is
+under `VICTORY_TEXTURE_MIN_FREE_MB` (`VICTORY_DRAW_TEXTURE_BOUND=0`: as before).
+The new executable was warmed first (`victory warm --used --again`, cold: 3,044
+pipelines in 653 s, median 83 ms, the slowest 102 s, none failed). #51 ran #50's
+settings on it.
+
+| | #50 | #51 |
+|---|---|---|
+| world from | 155 s | 101 s |
+| world fps median / peak | 1.70 / 2.20 | 1.70 / 1.90 (p90 693 ms) |
+| end | device removed, 259 s | device removed, 197 s ("will not respond", nothing of ours on the card) |
+| copies the title fills at the end | — | 7,938 alive, 1,895 MB |
+| slots the bound left waiting | — | **90** |
+| card at the end | — | 7,755 MB of a 6,492 MB budget |
+
+The bound engaged 90 times: draws' slots are not where most of these copies
+are made. They come from the lists' records of the textures they use
+(`draw.rs`), the title's uploads into textures (`host.rs`), slots made when
+their texture arrives (`descriptor::make_waiting`), and much of it while the
+card was still under budget in loading (the card went from 5.6 to 7.7 GB in the
+first 10 s of the world). No regression is attributed to it (the device went
+with nothing of ours on the card, as in #49 and #50), but it does not bound the
+memory. Next: count host copies by the path that makes them, then bound the
+largest path, or make room by letting the oldest idle copies go before the
+world loads.
+
 ## 6. Shaders
 
 No shader failed to translate in #47–#49 (0 failures; #49: 408 hits, 36
