@@ -249,3 +249,28 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         }
     }
 }
+
+/// A translation's bytes are the same every time: host pipelines are named
+/// by a hash of them (`victory_gpu::pipeline::library::name`), so bytes that
+/// varied with the process (a map's random iteration order, say) would turn
+/// every library entry into a miss whenever the shader cache is refilled.
+#[test]
+fn the_same_program_translates_to_the_same_bytes_every_time() {
+    use crate::resource::tests::{
+        WATERFALL_INDEXED_WAVE32, WATERFALL_JOINED_BUFFER_WAVE32, WATERFALL_JOINED_MIXED_WAVE32,
+        WATERFALL_JOINED_WAVE32,
+    };
+    for (words, buffers) in [
+        (WATERFALL_JOINED_WAVE32, false),
+        (WATERFALL_JOINED_MIXED_WAVE32, false),
+        (WATERFALL_JOINED_BUFFER_WAVE32, true),
+        (WATERFALL_INDEXED_WAVE32, false),
+    ] {
+        let first = build(words, buffers).dxil;
+        for round in 1..24 {
+            // Each translation's maps get keys of their own, as in another process.
+            let again = build(words, buffers).dxil;
+            assert!(again == first, "round {round}: {} bytes against {}", again.len(), first.len());
+        }
+    }
+}
