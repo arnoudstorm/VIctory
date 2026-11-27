@@ -408,6 +408,7 @@ impl HostPipeline {
             [cs] if cs.stage == "compute" => Some(cs),
             _ => None,
         };
+        super::library::kind(compute.is_some());
         if compute.is_none()
             && shaders
                 .iter()
@@ -596,6 +597,7 @@ impl HostPipeline {
             );
             let pso = match made {
                 Ok(pso) => pso,
+                Err(_) if super::library::deferred() => return None,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -745,7 +747,7 @@ impl HostPipeline {
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
-        if made.is_err() && rect_gs.is_some() {
+        if made.is_err() && rect_gs.is_some() && !super::library::deferred() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
@@ -755,6 +757,7 @@ impl HostPipeline {
         }
         let pso = match made {
             Ok(pso) => pso,
+            Err(_) if super::library::deferred() => return None,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();

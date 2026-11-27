@@ -62,6 +62,26 @@ impl Pending {
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        Self::made();
+    }
+
+    /// On a worker: makes it, or returns false if it was put aside for
+    /// the compile gate ([`super::library::may_defer`]): it is not made
+    /// yet and goes back to the queue.
+    fn make_or_put_aside(&self) -> bool {
+        if self.made.get().is_none() {
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            if super::library::take_deferred() {
+                return false;
+            }
+            // A title thread that made it meanwhile ([`now`]) made the same.
+            let _ = self.made.set(made);
+        }
+        Self::made();
+        true
+    }
+
+    fn made() {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -217,10 +237,16 @@ const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
+/// Put aside: the library did not hold it and its compile waits for the
+/// compile gate ([`put_aside`]).
+const GATED: u8 = 4;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Pipelines that need a driver compile while compiles are held back,
+    /// taken one at a time when the gate is free.
+    gated: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -228,7 +254,29 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            gated: VecDeque::new(),
         }
+    }
+
+    /// Takes back a pipeline a worker put aside for the compile gate.
+    fn put_aside(&mut self, p: Arc<Pending>) {
+        p.queue_state.store(GATED, Ordering::Relaxed);
+        self.gated.push_back(p);
+    }
+
+    /// The next pipeline: one put aside for the compile gate when `gate_free`
+    /// (those wait longest, and only one can compile at a time), else as
+    /// [`Self::pop`].
+    fn take(&mut self, early_ok: bool, gate_free: bool) -> Option<Arc<Pending>> {
+        if let Some(p) = self.requested.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some(p);
+        }
+        if gate_free && let Some(p) = self.gated.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some(p);
+        }
+        self.pop(early_ok)
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
@@ -318,6 +366,20 @@ pub(crate) static EARLY_PAUSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
 
+/// A worker's pipeline that waits for the compile gate goes back to the
+/// queue (still counted as waiting).
+fn put_aside(p: Arc<Pending>) {
+    QUEUE.lock().unwrap_or_else(|e| e.into_inner()).put_aside(p);
+}
+
+/// The compile gate was let go: a worker can take a pipeline put aside.
+pub(crate) fn gate_opened() {
+    let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if !queue.gated.is_empty() {
+        AVAILABLE.notify_one();
+    }
+}
+
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
@@ -343,9 +405,15 @@ fn next() -> Arc<Pending> {
     loop {
         // Asked outside the queue's lock: a system call.
         let early_ok = early_allowed();
+        let gate_free = !super::library::gate_held();
         let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = queue.pop(early_ok) {
+        if let Some(p) = queue.take(early_ok, gate_free) {
             return p;
+        }
+        if !queue.gated.is_empty() && !gate_free {
+            // The gate is let go (notified), or memory comes back.
+            let _ = AVAILABLE.wait_timeout(queue, Duration::from_millis(250));
+            continue;
         }
         if !early_ok && queue.early_waiting() {
             // Look again soon: memory comes back, or a draw promotes one.
@@ -398,8 +466,13 @@ fn workers() -> bool {
                         use windows::Win32::System::Threading::*;
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
+                    super::library::may_defer(true);
                     loop {
-                        next().make();
+                        let p = next();
+                        if !p.make_or_put_aside() {
+                            put_aside(p);
+                            continue;
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -512,6 +585,34 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &early));
         assert!(!queue.early_waiting());
         assert!(queue.pop(true).is_none());
+    }
+
+    /// A pipeline put aside for the compile gate waits while the gate is
+    /// held, and loadable work goes on meanwhile; once the gate is free it
+    /// comes before the rest of the early list (it has waited longest).
+    #[test]
+    fn pipelines_put_aside_wait_only_for_the_gate() {
+        let gated = Arc::new(Pending::new(Vec::new(), None));
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let later = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.push(&early, EARLY);
+        queue.push(&later, EARLY);
+        queue.put_aside(gated.clone());
+        // A draw cannot queue it a second time.
+        assert_eq!(queue.push(&gated, REQUESTED), None);
+
+        // Gate held: the early list goes on without it.
+        assert!(Arc::ptr_eq(&queue.take(true, false).unwrap(), &early));
+        // Requested work still comes first.
+        queue.push(&requested, REQUESTED);
+        assert!(Arc::ptr_eq(&queue.take(true, true).unwrap(), &requested));
+        // Gate free: the one put aside, then the rest.
+        assert!(Arc::ptr_eq(&queue.take(true, true).unwrap(), &gated));
+        assert_eq!(gated.queue_state.load(Ordering::Relaxed), MAKING);
+        assert!(Arc::ptr_eq(&queue.take(true, true).unwrap(), &later));
+        assert!(queue.take(true, true).is_none());
     }
 
     #[test]

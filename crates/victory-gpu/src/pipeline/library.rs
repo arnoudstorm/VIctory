@@ -70,6 +70,48 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// Pipelines made although the library holds their name: the load was
 /// refused (the stored description differs) and so was the store.
 pub(crate) static REMADE: AtomicU64 = AtomicU64::new(0);
+/// Library loads and driver creates by kind (`[graphics, compute]`), and
+/// the microseconds they took, for the lines that report the library.
+pub(crate) static LOADS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static LOAD_US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static CREATES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static CREATE_US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Loads the library refused (misses: the pipeline is created instead).
+pub(crate) static MISSES: AtomicU64 = AtomicU64::new(0);
+/// Times a worker put aside a pipeline the library did not hold because
+/// another thread was already at the compile gate ([`room_to_compile`]).
+pub(crate) static DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Whether this thread may put a pipeline that needs a held-back
+    /// compile aside instead of waiting at the gate (the pipeline workers).
+    static MAY_DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's pipeline was put aside so.
+    static DEFERRED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the pipeline this thread makes is a compute pipeline.
+    static COMPUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lets this thread put pipelines aside rather than wait at the compile gate.
+pub(crate) fn may_defer(on: bool) {
+    MAY_DEFER.set(on);
+}
+
+/// Whether this thread's pipeline was put aside since the last call (and
+/// forgets it): such a pipeline is not refused, it is made later.
+pub(crate) fn take_deferred() -> bool {
+    DEFERRED_HERE.replace(false)
+}
+
+/// Whether this thread's pipeline has been put aside (not cleared).
+pub(crate) fn deferred() -> bool {
+    DEFERRED_HERE.get()
+}
+
+/// Says whether the pipeline this thread makes next is a compute pipeline.
+pub(crate) fn kind(compute: bool) {
+    COMPUTE.set(compute);
+}
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -518,17 +560,21 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    let at = usize::from(COMPUTE.get());
     let Some(library) = library() else {
+        if defer_compile() {
+            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_000Au32 as i32)));
+        }
         MADE.fetch_add(1, Ordering::Relaxed);
         let _room = room_to_compile();
-        return create();
+        return timed(&CREATES[at], &CREATE_US[at], create);
     };
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        timed(&LOADS[at], &LOAD_US[at], || load(&library.library, PCWSTR(wide.as_ptr())))
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -544,11 +590,15 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    MISSES.fetch_add(1, Ordering::Relaxed);
+    if defer_compile() {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_000Au32 as i32)));
+    }
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _room = room_to_compile();
         let _call = call("make", name);
-        create()?
+        timed(&CREATES[at], &CREATE_US[at], create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -617,6 +667,72 @@ fn commit_room() -> Option<u64> {
     Some((info.CommitLimit.saturating_sub(info.CommitTotal) * info.PageSize) as u64)
 }
 
+/// The loads and creates by kind with their mean times, the library's
+/// misses and the pipelines put aside for the compile gate, for the log.
+pub(crate) fn kind_stats() -> String {
+    let n = |a: &[AtomicU64; 2], i: usize| a[i].load(Ordering::Relaxed);
+    let mean = |count: u64, us: u64| if count == 0 { 0.0 } else { us as f64 / count as f64 / 1e3 };
+    let side = |i: usize, kind: &str| {
+        format!(
+            "{kind}: {} loads ({:.1} ms each), {} creates ({:.1} ms each)",
+            n(&LOADS, i),
+            mean(n(&LOADS, i), n(&LOAD_US, i)),
+            n(&CREATES, i),
+            mean(n(&CREATES, i), n(&CREATE_US, i)),
+        )
+    };
+    format!(
+        "{}; {}; misses {}; put aside for the compile gate {}; compiles held {} ({} ms)",
+        side(0, "graphics"),
+        side(1, "compute"),
+        MISSES.load(Ordering::Relaxed),
+        DEFERRED.load(Ordering::Relaxed),
+        HELD[0].load(Ordering::Relaxed),
+        HELD[1].load(Ordering::Relaxed),
+    )
+}
+
+/// Runs `f`, counting it in `count` and its microseconds in `us`.
+fn timed<T>(count: &AtomicU64, us: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    let began = std::time::Instant::now();
+    let out = f();
+    count.fetch_add(1, Ordering::Relaxed);
+    us.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    out
+}
+
+/// Whether this thread puts its pipeline aside rather than queue at the
+/// compile gate: it may ([`may_defer`]), compiles are held back now, and
+/// another thread is already at the gate. Queued at the gate, each worker
+/// would hold a pipeline the library cannot load for up to ten seconds, one
+/// after another, while pipelines the library does hold wait behind them.
+fn defer_compile() -> bool {
+    if !MAY_DEFER.get() || !AT_GATE.load(Ordering::Acquire) || !compiles_held_back() {
+        return false;
+    }
+    DEFERRED_HERE.set(true);
+    DEFERRED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Whether a thread holds the compile gate (waits at it or compiles).
+static AT_GATE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the compile gate is held: pipelines put aside wait for it.
+pub(crate) fn gate_held() -> bool {
+    AT_GATE.load(Ordering::Acquire)
+}
+
+/// The compile gate, held while one compile waits for room and runs.
+pub(crate) struct Gate(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        AT_GATE.store(false, Ordering::Release);
+        super::make::gate_opened();
+    }
+}
+
 /// Compiles made one at a time while commit room is short.
 static SHORT_OF_ROOM: Mutex<()> = Mutex::new(());
 /// Compiles held back so far, and the milliseconds they waited.
@@ -630,7 +746,7 @@ static HELD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// used up (a 16 GB laptop in the world: 1.4 GB left) a burst of them can
 /// take what the title's own allocations then fail for. `None` when there
 /// is room: compiles run as they always did.
-fn room_to_compile() -> Option<MutexGuard<'static, ()>> {
+fn room_to_compile() -> Option<Gate> {
     let limit = compile_headroom();
     let floor = compile_min_avail();
     #[cfg(windows)]
@@ -646,6 +762,8 @@ fn room_to_compile() -> Option<MutexGuard<'static, ()>> {
         return None;
     }
     let guard = SHORT_OF_ROOM.lock().unwrap_or_else(|e| e.into_inner());
+    AT_GATE.store(true, Ordering::Release);
+    let guard = Gate(guard);
     let began = std::time::Instant::now();
     #[cfg(windows)]
     while began.elapsed() < std::time::Duration::from_secs(10) && short(commit_room(), physical()) {
@@ -660,10 +778,20 @@ fn room_to_compile() -> Option<MutexGuard<'static, ()>> {
             room_mb = room.unwrap_or(0) >> 20,
             limit_mb = limit >> 20,
             avail_floor_mb = floor >> 20,
+            put_aside = DEFERRED.load(Ordering::Relaxed),
             "driver compiles held back: the system's commit room or physical RAM is short (VICTORY_COMPILE_HEADROOM_MB, VICTORY_COMPILE_MIN_AVAIL_MB)"
         );
     }
     Some(guard)
+}
+
+/// Whether driver compiles are held back now ([`room_to_compile`]).
+fn compiles_held_back() -> bool {
+    let (limit, floor) = (compile_headroom(), compile_min_avail());
+    #[cfg(windows)]
+    return short_of_room(commit_room(), limit, crate::host::available_physical_ram(), floor);
+    #[cfg(not(windows))]
+    return short_of_room(None, limit, None, floor);
 }
 
 /// Available physical RAM below which driver compiles go one at a time, as
@@ -763,6 +891,7 @@ pub(crate) fn save(now: bool) {
             remade = REMADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            stats = %kind_stats(),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
