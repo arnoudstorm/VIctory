@@ -238,3 +238,74 @@ number is reused after a launch.
 
 Desktop tests (RTX 4060, RTX 5070 Ti) need the user on those machines;
 their exact CPU and RAM are not verified yet.
+## Cycle VI continuation, 27 November
+
+The clean starting state was `8fc7225af7d8d53353286bbe4d3525a011cf86ba` on `experiment/cycle-vi-cross-fork`. The fork's published branch was at `1cf16af6656f1ee843fc75cef07679d6689bdbc4`. The starting integration is preserved at `backup/cycle-vi-integrated-8fc7225a`. The protected `laptop/780m` ref is `f11964e7037089f26c5ca986feb1166b58bdae3e`.
+
+The latest consumed test number in the runtime ledger is 41. The archived file hash verified against its provenance, source `2e6645ec4962ae9c5d73ca39927d0674ba181659`, SHA-256 `7C5C588638DF06951A5DFFE05A1A9EC919457B920C123594BF2ACEDD95660784`. This was an optimized diagnostic build, lowmem with a 256 MiB card cap, texture no-wait, shared tiles on and alias guard off, with a prewarmed shader cache and the default shader-loop limit. The user-reported later interactive breakthrough has no matching numbered log, hash or launch environment in the inspected artifacts. Test #41 recorded world submissions, median 1.50 FPS and peak 2.20 FPS, and must remain attributed to the earlier source. It reached repeated near-zero RAM events despite starting with about 9,339 MiB. Its archived observer used a two-second dwell at 64 MiB. The integrated candidate is preserved as a new independently built diagnostic executable with SHA-256 `A8E005B370E55AD107527EC494959652DAAE4B7186010CBDB71781B3D9425691`. Test #42 remains unused. With only about 5–6 GiB available during this session and no evidence of a large runtime memory reduction, a title run would neither reproduce the earlier conditions nor establish safe world-stage headroom.
+
+### The seven original integrations
+
+| Local / original | Audit and validation scope |
+|---|---|
+| `d3f03447` / `a23d1b46` | Belobug release thin LTO and one codegen unit apply to both release and inherited diag profiles. Changes code generation and compile memory. There is no runtime toggle or measured title gain. |
+| `cbf939ec` / `40b8b9b5` | Belobug defers the prior Shadow on a same-address registration. The registry selects the new owner immediately while the queue retains the old allocation through its submission. Transient memory can increase safely. |
+| `e504d944` / `92d353f8` | Belobug/romainhedouin retains the PSO and root once by native PSO address per recording. A retained COM reference prevents ordinary address reuse. A synthetic repeated-binding case with the same PSO and different native root objects would help establish the scope of that identity assumption, particularly with driver cache loads. |
+| `1eb4c8e1` / `b022d860` | Belobug/romainhedouin avoids the pending lock after publication. The slow path publishes the OnceLock after replaying buffered descriptors. Concurrent writers still use the existing mirror path. |
+| `656605af` / `05ee4387` | The a-publier refresh policy uses the existing worker and ordering machinery. Absent an override it enables on four or more available logical CPUs. Its opt-out is `VICTORY_WIDE_REFRESH=0`. Compare on UMA with identical draws because concurrent refresh can shift memory bandwidth demand. |
+| `e715735a` / `cc11cccc` | The indirect scratch state is kept readable between commands and restored on reuse, growth or close. The WARP and host fixtures cover read, clamp and transition cases. Existing path controls can vary indirect workload, but they do not switch off this state fix independently. Validate transitions on both NVIDIA adapters. |
+| `8fc7225a` / `21323661` | The avatarmanz wait patch runs on CPU instruction faults and is independent of graphics vendor. Replacement checks byte shape and uses an aligned atomic update with page restoration and an instruction-cache flush. Existing tests cover opcode shape and restored protection. Concurrent inspection of live code and platform failures when restoring protection or flushing deserve a targeted follow-up. Its opt-out is `VICTORY_PATCH_WAITS=0`. |
+
+Exactly two of the seven integrated behaviors have independent runtime overrides. LTO is a build-profile decision. The other fixes are intrinsic to their paths. No additional switches were needed for the continuation changes.
+
+### Warning and parallel-test audit
+
+Normal `cargo check` at the untouched starting revision showed four warnings. The existing unused `Host::execute_own` and `Presenter::ahead` both trace to `578d459c3`. Neither has a caller or reader in either configuration, so the unreachable private implementation and empty field were removed. The existing `placed_filler_twins` from `6d19463de` and `tiles::line` from `8b5c8bfe` are read only by diagnostics and their diagnostic fixture, and are now feature-gated accordingly. The supposed newly introduced warnings were a misattribution. The wait patch's distinct `sites::line` lives inside a diagnostics module and is called. The indirect commit did not introduce the presenter field.
+
+`221823fc` repairs two independent fixture ordering problems. Shared-tile teardown now runs with the real submission mutex held after settling, so unrelated runtime work cannot defer the last drop across the assertion. The tile copy-back fixtures explicitly take the queued snapshots under the same lock before simulating GPU writes. Previously another submission could take a snapshot after the test modified the bytes, explaining a zero-byte copy-back result. The output assertions remain intact. The runtime retirement race is separate. The old fast check could observe a pending submission, then enqueue after that submission completed and drained the retirement queue. The new recheck under the drain lock ensures the object is either dropped after observed completion or included in the drain. The early-drop path still releases outside the queue lock.
+
+`64f21961` adapts only the root-constant portion of romainhedouin's `e6b638622b7cd1469feb976a5a3050aa6ceb869b` from Belobug's line. It keeps up to 64 dwords in stack storage, eliminating the allocation for each supported root-constant stage. Unexpected larger declarations keep the old heap fallback. No table ordering, descriptor identity, root binding or shader translation behavior changed.
+
+### Remaining integration order and hardware
+
+The existing candidate table above is the available conflict ledger. The full ordered list of all 57 trial SHA values was not found. Within the documented conflicts, prefer the allocation-local portions of the draw-path group before moving anything that changes resource ownership. `84ea9c12` needs fixtures for command-list mutation and copy/write invalidation. `b41f3f3f` requires equality checks and collision tests against this fork's descriptor record shapes. `5e08eee0` needs copy-footprint alignment and detached-list/fence lifetime validation before reusing scratch, plus a retained-capacity measurement. The rest of `e6b63862` changes descriptor-table state and remains separate.
+
+The shader fixes `abbbd6b0`, `4fd34fdd` and `41d3184e` need translation fixtures and an explicitly re-prewarmed cache. The upload-order group `3bab23c0` / `350c6864` / `d1c412c5` depends on the other fork's texture book and completion flow. It should be reconstructed as a narrow producer-consumer fixture before porting. PSO prewarm `b7ab9c49` / `a30829c4` must respect the 16 GiB compile headroom gate. VRAM scaling `fffafee5` / `9beff3cd` / `de4ae616` / `010b90a1` and asynchronous submission `b8b30d1c` / `3a99ee61` / `37332f4d` can increase live memory and remain deferred. The in-place constants and renderer ports need exact range ownership, cache coherency and replay fixtures. Preserve existing authorship and GPL headers in any future ports.
+
+On the 780M, keep a guarded lowmem reference with the last recorded scene and matched cache, and measure private commit, available RAM and DXGI budgets independently. On the RTX 4060 and RTX 5070 Ti, start with the same resolution, route, ray tracing off, default GPU compatibility settings and no UMA-only overrides. Log actual driver, local/nonlocal budgets and shader stage capabilities. Compare the two opt-outs one at a time and keep shader caches and number of in-flight submissions comparable. Report per-present world-frame percentiles and distinguish GPU timestamps from fence waiting. Establish visible output and input response separately before calling the result gameplay. No NVIDIA performance or rendering results were obtained.
+
+### Final automated validation and reproduction
+
+The serial workspace finished with 587 passed, zero failed and 27 ignored. GPU diagnostics passed 177/0/20, HLE diagnostics passed 124/0/4, and the loader diagnostic library passed 28/0/0. Separate HLE and loader integration binaries passed four tests total. The isolated retirement fixture also passed. The final GPU library ran 12 times at 16 threads, each with 165 passed, zero failed and 17 ignored. A thirteenth pass used wide refresh off. An intermediate audit run exited with `0xc0000005` and produced no attributable stack or named failure. That crash did not recur in the final stress runs, so its cause remains open. The two assertion failures were reproduced and addressed separately.
+
+```powershell
+cargo check --locked -p victory
+cargo test --locked --workspace --all-targets -- --test-threads=1
+cargo test --locked -p victory-gpu -p victory-hle -p victory-loader --features diagnostics -- --test-threads=1
+1..12 | ForEach-Object { cargo test --locked -p victory-gpu --lib -- --test-threads=16; if ($LASTEXITCODE) { throw "GPU suite repetition $_ failed" } }
+cargo test --locked --profile diag -p victory-gpu --lib inline_root_words_cost -- --ignored --nocapture --test-threads=1
+cargo build --locked --profile diag -p victory --features diagnostics
+cargo build --locked --release -p victory
+```
+
+On separate shells, set `VICTORY_WIDE_REFRESH=0` for the refresh opt-out and `VICTORY_PATCH_WAITS=0` for the wait-patch opt-out. For the next authorized title baseline, archive the exact candidate, use the ordinary 256 MiB immediate physical guard and retain the independent watchdog. Use the same scene and prewarmed cache only after sufficient headroom is established. Reserve the next number when a title process actually starts. The available logs stop at #41, so there is no comparable live benchmark on the seven-commit binary.
+
+The optimized root-storage benchmark alternated six matched pairs of 200,000 preparations at 8, 16, 32 and 64 dwords. The old heap path took 5.004–5.079 ms per pair arm, and inline storage took 0.657–0.661 ms. The median was 5.034 ms versus 0.661 ms. The isolated case exercises allocation and initialization, without rendering or D3D12 calls. It establishes the removal of one allocation per eligible stage. World frame time, GPU time and peak committed memory remain unmeasured on the new candidate.
+
+For a desktop smoke test, hash the archived executable with `Get-FileHash -Algorithm SHA256` and run its `config` subcommand before launch. In a fresh PowerShell process, leave shared-tile, in-place and AMD upscaler overrides unset, set `VICTORY_RAYS=0`, and pass `run <authorized title executable> --execute` through the independent guarded runner. Keep the scene, resolution and driver fixed for each A/B pair. Start by verifying visible output and control on both NVIDIA cards. A separate telemetry pass can enable diagnostics and per-present timing. These are reproducible starting configurations, without validation on either desktop.
+
+In the existing laptop workspace, this exact Test #42 runner validation succeeded without launching a title. Before a future authorized launch, verify the launcher emits `VICTORY_SHADER_LOOP_LIMIT=0` and the pinned lowmem budgets if matching Test #41. Use shared tiles on and alias guard off only for that matched condition. The stricter ordinary guard can end the run earlier, so termination times cannot be compared directly.
+
+```powershell
+& ./outputs/cycle5/claude/claude-runner.ps1 -RunNumber 42 -CardMB 256 -ProvenanceFile outputs/cycle6/baseline-8fc7225a-provenance.json -Preset lowmem -Diagnostic -GpuAllocationSampler -WindowBacking -MemorySamples -TextureNoWait -CompileMinAvailMB 1024 -MaxSeconds 900 -ValidateOnly
+```
+
+### Archived executables
+
+Both final binaries were built from `64f21961db8bf27268db8f7d8688b787dd6f7b8c`. The integrated baseline and both final archives passed CLI smoke tests. The logs, manifests and binaries are under the local workspace's `outputs/cycle6`.
+
+| Profile | Executable | SHA-256 |
+|---|---|---|
+| Integrated baseline, diag | `VIctory-cycle6-8fc7225a-diag.exe` | `A8E005B370E55AD107527EC494959652DAAE4B7186010CBDB71781B3D9425691` |
+| Final diag | `VIctory-cycle6-64f21961-diag.exe` | `9968338FA1DA4A032BE6BF5203E26D0135B248469C3711780E2DB373C5CEC227` |
+| Final release | `VIctory-cycle6-64f21961-release.exe` | `922DE0403FD78A272663F494F4E30EB234BAD3E993D126A851F25E6F67C4A65E` |
