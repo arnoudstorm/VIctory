@@ -191,6 +191,39 @@ Exact settings, from the launch commands:
 Not all of #38-#40 completed: #38 and #40 ended themselves (exit 0, no
 record), #39 was stopped by the manual stop file at the 15-minute mark.
 
+## Test #41: current baseline without the alias guard
+
+`2e6645ec` (SHA-256 `7C5C5886…0784`, the #40 executable), #39's switches
+without `VICTORY_ALIAS_GUARD`, loop limit default (cache prewarmed),
+observer on, 900 s cap. Started with 9.4 GB of RAM available. Stopped by
+hand (manual stop file) at 571 s on the user's request; no panic, no
+device removal.
+
+| | #40 (alias guard on) | #41 (off) |
+|---|---|---|
+| World from | 284 s | **168 s** |
+| World time | 187 s | 403 s |
+| fps median / mean / peak | 0.60 / 0.57 / 0.70 | **1.50 / 1.51 / 2.20** |
+| Sample frame time p50 / p90 / p95 / p99 | 1,674 / 2,167 / 3,106 / 4,642 ms | 651 / 950 / 1,089 / 1,673 ms |
+| CPU per frame (median) | 1,504 ms | 341 ms |
+| GPU wait (median) | 84 ms | 161 ms |
+| Texture refreshes, CPU per frame (last 60 lines) | 1,282 ms | **56 ms** |
+| Peak private / lowest available | 13.22 GiB / 1 MiB | 14.02 GiB / 0 MiB (dips under 2 s) |
+| VRAM | 5,427 of 6,533 MB | up to 7,586 MB against a 6,507 MB budget (over) |
+
+- **The alias guard is the slowdown** (measured, one pair, same build
+  and loop limit): texture refreshes 1,282 → 56 ms a frame, fps 0.60 →
+  1.50. It stays off; the #42 run with it on is no longer needed for
+  this question. Its purpose (fewer hashed bytes) has to be met another
+  way.
+- **Hair** (observed, frame 3594): with the default loop limit Lucia's
+  hair is drawn as curls, not streaks: **the loop limit of 32 caused the
+  streaks.** The hair has no colour (white/grey).
+- **Skin**: still black with bright speckles: **not** the loop limit.
+- The scene stays very dark (no indirect light).
+- Peak 2.20 fps is the best single sample so far; the median (1.50) is
+  below #34's 1.90 (loop limit 32 there; different scene time, one run each).
+
 ## Next tests (proposed)
 
 The runner accepts run numbers up to 40; it needs #41+ added first. No
