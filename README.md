@@ -1,17 +1,177 @@
-# VIctory fork (work in progress)
+# VIctory, Cycle VI (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+Research fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+files you supply yourself. This repository holds the Cycle VI work: pipeline
+(PSO) prewarming, memory residency on shared-memory GPUs, and tests on a
+Radeon 780M laptop (Ryzen 7 8840HS, 16 GB RAM). The findings are in
+[docs/research/CYCLE_VI_PHASE_II.md](docs/research/CYCLE_VI_PHASE_II.md).
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+**This repository contains no game files, code or assets, and never will.**
+You need your own legally obtained copy of the game. It is not affiliated
+with or endorsed by the game's developer or publisher.
 
-> **AMD RDNA3 (RX 7000 series):** this fork's `main` also carries the AMD and
-> relay fixes and a launcher tested on an RX 7600 XT. See [RDNA3.md](RDNA3.md).
+**Not playable.** On the 780M the world renders at about 1.7 frames per
+second, and every run so far has ended with the GPU device lost once memory
+runs out, about 3 to 4 minutes in. Expect that.
+
+## Before you run it
+
+1. **Hardware and Windows.** Windows 10 or 11 x64, a CPU with AVX2, and a
+   Direct3D 12 GPU with shader model 6.6 and mesh shaders. 16 GB of RAM is
+   the minimum tested; 32 GB is much better.
+2. **Memory.** Leave the Windows paging file on (system managed is fine) and
+   close other programs, browsers especially. The title needs several GB of
+   Windows commit at start-up: check **Committed** under
+   **Task Manager → Performance → Memory**. If `crashes.log` reports Windows
+   error 1455, free memory or enlarge the paging file and try again. Do not
+   turn off the paging file, memory compression or the GPU timeout recovery
+   (TDR): they are what lets Windows recover when a run runs out of memory.
+3. **Your game files.** Put your own copy of the game in a folder **outside**
+   this repository. The tools refuse paths inside it.
+4. **Rust.** Install [rustup](https://rustup.rs) and the Visual Studio C++
+   build tools. The exact toolchain (1.98.1, MSVC) is pinned in
+   `rust-toolchain.toml` and installs itself on the first build.
+5. **Set up the checkout:**
+
+   ```powershell
+   cargo xtask install-hooks                # asset-policy check on every commit
+   copy victory.example.toml victory.toml   # then set game_dir (outside the repo)
+   cargo run -p victory -- config           # checks your paths
+   ```
+
+6. **Build:**
+
+   ```powershell
+   cargo build --release -p victory                                # target\release\victory.exe
+   cargo build --profile diag -p victory --features diagnostics    # target\diag\victory.exe, with logging and captures
+   ```
+
+7. **Warm the pipeline cache (strongly recommended, once per build).** AMD's
+   driver keeps compiled pipelines per executable, so the first run of a new
+   build otherwise spends minutes compiling pipelines inside the world. Run
+   the title once with `VICTORY_PIPELINE_BOOK=1` set, which records the
+   pipelines it uses. Then warm them with the same shader settings as your
+   runs (these are the launcher's `low` preset):
+
+   ```powershell
+   $env:VICTORY_SHADER_LOOP_LIMIT = '64'
+   $env:VICTORY_F16_NEAREST = '1'
+   target\release\victory.exe warm --used --jobs 4
+   ```
+
+   A cold warm takes about 10 minutes on the 780M. After a rebuild, run it
+   again with `--again`. It pauses whenever free memory drops under 2 GB
+   (`VICTORY_WARM_MIN_AVAIL_MB`).
+
+## Running
+
+On a 16 GB laptop like the 780M, use the launcher. It picks the newest build
+and sets the measured settings:
+
+```powershell
+.\run-laptop.ps1 -GameDir "D:\path\to\your\game"
+```
+
+Or run the executable directly with your own settings:
+
+```powershell
+target\release\victory.exe run "D:\path\to\your\game\<the title's exe>" --execute
+```
+
+Saves, settings and `crashes.log` go to `%LOCALAPPDATA%\victory\data`;
+shader and pipeline caches go to `%LOCALAPPDATA%\victory\cache`. Controls are
+listed under *Getting started* further down.
+
+## Automated tests
+
+```powershell
+cargo test --workspace
+```
+
+The tests need no game data and no GPU. CI runs on every pull request and on
+every push to `main` ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
+Clippy with warnings as errors on the normal build and on the diagnostics
+build, then all tests. A pull request has to pass them.
+
+What the roughly 650 tests cover:
+
+| Crate | Tests | What they check |
+|-------|------:|-----------------|
+| `victory-shader` | ~220 | The console shader recompiler: decoding GPU instructions, lowering to DXIL, the clean-up passes, loop limits, and that translations are deterministic (the same shader always gives the same output, so caches stay valid) |
+| `victory-gpu` | ~200 | The Direct3D 12 back end in isolation: descriptor and resource bookkeeping, texture layouts and detiling, the pipeline queue and compile gate, the pipeline book used by `warm`, and the memory limits on texture copies (for example, draws stop making new copies while the card is over budget) |
+| `victory-hle` | ~130 | The runtime services the title calls: users, licences, packages, saves that survive being killed at any step, input, audio decoding |
+| `victory-formats` | ~30 | Archive formats, zlib and BCPack decompression |
+| `victory-loader` | ~30 | Loading the title's executable and DLLs, imports, crash reports |
+| `victory-core`, `victory-pe`, `victory-pipeline`, `victory-game`, `apps/victory` | ~30 | Shared helpers, the PE parser, pipeline packs, title-specific glue, command-line parsing |
+| `xtask` | 4 | The asset policy: fails if the repository contains game files, executables or other forbidden binaries |
+
+To run one crate's tests, use `cargo test -p victory-gpu`. To run tests by
+name, use `cargo test -p victory-gpu draws_wait`.
+
+Game runs on real hardware are not automated, because they need your own
+game files. The research notes record each numbered test run by hand.
+
+## Changing the settings
+
+Settings are environment variables named `VICTORY_*`. Each one is described
+in a comment in the code where it is read (search for its name).
+
+**With the launcher**, pick a preset:
+
+| Preset | For | Texture copy budget | Shader loop limit | Upscale filter |
+|--------|-----|--------------------:|------------------:|----------------|
+| `auto` (default) | `low` on 16 GB or less, otherwise `balanced` | | | |
+| `low` | 16 GB laptops | 1,024 MB | 64 | bilinear |
+| `lowmem` | 16 GB laptops that run out of memory in the world | 768 MB | 32 | bilinear |
+| `balanced` | 32 GB PCs | 2,048 MB | 256 | bicubic |
+| `quality` | 32 GB or more, dedicated GPU | 4,096 MB | 1,024 | bicubic |
+
+```powershell
+.\run-laptop.ps1 -GameDir "D:\path\to\your\game" -Preset lowmem
+```
+
+Other launcher switches: `-Safe` (submission relay off), `-Bilinear`,
+`-NoAmbient` (no ambient-light fallback), `-AutoStart` (presses A through
+the first screens), `-CutsceneTest`, `-CaptureDir <folder>`, `-NoCapture`,
+`-BuildPath <exe>`, and `-DryRun` (prints the settings without starting).
+
+The launcher sets its variables itself and replaces any you set before. To
+change a single value, edit the preset table near the top of
+`run-laptop.ps1`, or start `victory.exe` directly with your own variables:
+
+```powershell
+$env:VICTORY_TEXTURE_BUDGET_MB = '768'
+$env:VICTORY_SHADER_LOOP_LIMIT = '64'
+target\release\victory.exe run "D:\path\to\your\game\<the title's exe>" --execute
+```
+
+The settings you are most likely to change:
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_TEXTURE_BUDGET_MB` | The most memory host texture copies may use |
+| `VICTORY_TEXTURE_MIN_FREE_MB` | Optional texture uploads stop below this much free RAM |
+| `VICTORY_DRAW_TEXTURE_BOUND=0` | Draws make texture copies even while memory is short (the bound is on by default) |
+| `VICTORY_KEEP_SNAPSHOTS_MB` | Memory for kept snapshots of title buffers |
+| `VICTORY_SHADER_LOOP_LIMIT` | Translated shader loops stop after this many iterations (lower is faster but less exact). It is part of the shader cache key, so warm again after changing it |
+| `VICTORY_F16_NEAREST` | Shader rounding mode; also part of the shader cache key |
+| `VICTORY_RELAY=0` | Submission relay off (slower, safer) |
+| `VICTORY_FFX_FILTER` | `bilinear` or `bicubic` upscaling |
+| `VICTORY_AMBIENT` | Strength of the ambient-light fallback, or `off` |
+| `VICTORY_PIPELINE_BOOK=1` | Records the pipelines the title uses, for `victory warm` |
+| `VICTORY_WARM_MIN_AVAIL_MB` | `warm` pauses while free RAM is under this (default 2048) |
+| `VICTORY_LOG=victory_gpu=debug,info` | More logging (diagnostics build) |
+
+`victory.toml` holds only paths (game, cache and data folders), and
+environment variables override it. More debugging variables are listed under
+*Debugging* below.
+
+## Contributing
+
+Fork the repository and open a pull request against `main`. Only the owner
+can push or merge. Never commit game files, executables, recordings, keys or
+anything copyrighted: the asset-policy hook and CI refuse them.
 
 ## Credits
 
@@ -25,7 +185,7 @@ developer or publisher.
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+## Earlier status of this fork on an RTX 4070 (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
