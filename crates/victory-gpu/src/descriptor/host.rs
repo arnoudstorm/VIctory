@@ -1490,11 +1490,17 @@ impl HostHeap {
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
             // here when a draw reads the slot through a table.
-            let waiting = if for_draw { None } else { view.waiting_texture() };
+            // A draw makes the texture's host copy now, unless memory is
+            // short for one the title fills (`resource::defer_for_draw`):
+            // then the slot waits too, and a later draw or the texture pass
+            // makes it once there is room.
+            let waiting = view
+                .waiting_texture()
+                .filter(|&texture| !for_draw || crate::resource::defer_for_draw(texture));
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let later = waiting.is_some() || (!for_draw && view.is_buffer());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing

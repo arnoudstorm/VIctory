@@ -1459,15 +1459,79 @@ pub(crate) fn room() -> bool {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .map(|[budget, used, ..]| (budget, used));
-    static MIN_FREE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let min_free = *MIN_FREE.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_MIN_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
-    });
-    let pc = crate::host::available_physical_ram().map(|free| (free, min_free));
+    let pc = crate::host::available_physical_ram().map(|free| (free, texture_min_free()));
     if !background_headroom(card, background_reserve()) {
         return false;
     }
     room_for(filled, limit, card, room_percent(), pc)
+}
+
+/// Whether a draw leaves title texture `texture` without a host copy for now: a
+/// texture the title fills, while the card is at or past the budget the
+/// system gives it or the PC's free physical memory is under
+/// `VICTORY_TEXTURE_MIN_FREE_MB`. Its slot waits, as slots of textures
+/// picked by index wait without room ([`room`]); the draw reads nothing
+/// from it until a later draw, or the texture pass, finds room.
+///
+/// Without it, only copies for textures picked by index were bounded:
+/// draws made copies for every texture they bound whatever the memory, and
+/// in game test 49 the copies the title fills went from 0.7 to 1.9 GB in a
+/// later scene, the card to 7.8 GB of a 6.5 GB budget with ~500 MB of the
+/// PC's memory free, and the device was reset. `VICTORY_DRAW_TEXTURE_BOUND=0`
+/// makes them as before. Memory is asked again at most every 50 ms.
+#[cfg(windows)]
+pub(crate) fn defer_for_draw(texture: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DRAW_TEXTURE_BOUND").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    if !title_fills(texture as This) {
+        return false;
+    }
+    /// When memory was last looked at (ms), and whether it was short.
+    static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let now = crate::host::now_ms();
+    let asked = ASKED.load(Relaxed);
+    let short = if asked != 0 && now.saturating_sub(asked) < 50 {
+        SHORT.load(Relaxed)
+    } else {
+        let card = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, used, ..]| (budget, used));
+        let pc = crate::host::available_physical_ram().map(|free| (free, texture_min_free()));
+        let short = short_for_new(card, pc);
+        SHORT.store(short, Relaxed);
+        ASKED.store(now.max(1), Relaxed);
+        short
+    };
+    if short {
+        DRAW_DEFERRED.fetch_add(1, Relaxed);
+    }
+    short
+}
+
+/// Slots a draw left waiting for lack of memory ([`defer_for_draw`]),
+/// since the start.
+#[cfg(windows)]
+pub(crate) static DRAW_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_TEXTURE_MIN_FREE_MB` in bytes (1536 unless set; 0: off).
+#[cfg(windows)]
+fn texture_min_free() -> u64 {
+    static MIN_FREE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN_FREE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIN_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
+    })
+}
+
+/// [`defer_for_draw`]'s decision from the card's `(budget, used)` and the
+/// PC's `(free, least)` physical memory, where the system says (a 0 budget
+/// or floor: not looked at).
+fn short_for_new(card: Option<(u64, u64)>, pc: Option<(u64, u64)>) -> bool {
+    card.is_some_and(|(budget, used)| budget > 0 && used >= budget)
+        || pc.is_some_and(|(free, least)| least > 0 && free < least)
 }
 
 /// Leave room for essential allocations made outside the background pass.
@@ -1521,7 +1585,24 @@ fn room_for(filled: u64, limit: Option<u64>, card: Option<(u64, u64)>, percent: 
 
 #[cfg(test)]
 mod room_tests {
-    use super::{background_headroom, room_for};
+    use super::{background_headroom, room_for, short_for_new};
+
+    /// Draws make new copies of textures the title fills only while the
+    /// card is under its budget and the PC has its free memory.
+    #[test]
+    fn draws_wait_for_new_copies_only_when_memory_is_short() {
+        // Game test 49: the card at 7.8 GB of 6.5, ~500 MB of the PC free.
+        assert!(short_for_new(Some((GB * 65 / 10, GB * 78 / 10)), Some((GB / 2, GB * 3 / 2))));
+        // At the budget exactly: short.
+        assert!(short_for_new(Some((6 * GB, 6 * GB)), None));
+        // The PC alone short.
+        assert!(short_for_new(Some((7 * GB, 5 * GB)), Some((GB, 2 * GB))));
+        // Room on both: draws make them.
+        assert!(!short_for_new(Some((7 * GB, 5 * GB)), Some((3 * GB, 2 * GB))));
+        // Nothing known, a zero budget or a zero floor: never short.
+        assert!(!short_for_new(None, None));
+        assert!(!short_for_new(Some((0, 9 * GB)), Some((GB, 0))));
+    }
 
     #[test]
     fn background_reserve_responds_to_budget_shrink_and_recovery() {
