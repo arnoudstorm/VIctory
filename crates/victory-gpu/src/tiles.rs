@@ -333,7 +333,7 @@ impl Tiles {
     /// The window is of title memory from `start` (on the tile grid): its
     /// tiles may be shared with other windows' (callers check [`sharing`]).
     pub(crate) fn of_title(mut self, start: u64) -> Tiles {
-        if start % TILE as u64 == 0 && start != 0 {
+        if start.is_multiple_of(TILE as u64) && start != 0 {
             self.first_page = start / TILE as u64;
         }
         self
@@ -535,7 +535,7 @@ pub(crate) fn chunks(from: usize, to: usize) -> impl Iterator<Item = (usize, usi
 /// For the memory line: tiles mapped (MB) and heaps held (MB).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn line() -> (u64, u64, u64) {
-    let mb = |tiles: u64| tiles * TILE as u64 >> 20;
+    let mb = |tiles: u64| (tiles * TILE as u64) >> 20;
     (mb(MAPPED.load(Ordering::Relaxed)), mb(HEAPS.load(Ordering::Relaxed) * PER_HEAP as u64), mb(BY[0].load(Ordering::Relaxed)))
 }
 

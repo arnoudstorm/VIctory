@@ -3601,7 +3601,7 @@ mod tiled_tests {
         fn new(len: usize) -> Self {
             // SAFETY: new private title stand-in.
             let data = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
-            assert!(!data.is_null() && data as usize % TILE == 0);
+            assert!(!data.is_null() && (data as usize).is_multiple_of(TILE));
             // SAFETY: the writable allocation is len bytes.
             unsafe { std::ptr::write_bytes(data, 0x6a, len) };
             Self(data)
@@ -3743,7 +3743,7 @@ mod tiled_tests {
         // Title memory of our own, on the 64 KiB grid.
         // SAFETY: a fresh allocation of LEN bytes, freed at the end.
         let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
-        assert!(!title.is_null() && title as usize % TILE == 0);
+        assert!(!title.is_null() && (title as usize).is_multiple_of(TILE));
         // SAFETY: inside the allocation.
         for (i, b) in unsafe { std::slice::from_raw_parts_mut(title, LEN) }.iter_mut().enumerate() {
             *b = (i / 4096) as u8 ^ 0x33;

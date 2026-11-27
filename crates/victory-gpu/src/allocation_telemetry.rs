@@ -112,16 +112,16 @@ pub(crate) fn note(kind: &'static str, id: u64, bytes: u64, aux: u64) {
     if !enabled() {
         return;
     }
-    if let Ok(mut ring) = EVENTS.try_lock() {
-        if ring.push(Event {
+    if let Ok(mut ring) = EVENTS.try_lock()
+        && ring.push(Event {
             kind,
             id,
             bytes,
             aux,
             us: utc_us(),
-        }) {
-            return;
-        }
+        })
+    {
+        return;
     }
     LOST.fetch_add(1, Relaxed);
 }

@@ -94,7 +94,7 @@ pub(crate) fn start() {
                 let began = std::time::Instant::now();
                 let utc = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
                 let (after, regions) = snapshot();
-                if scan%6==0 && modules(&mut file,utc).is_err(){return}
+                if scan.is_multiple_of(6) && modules(&mut file,utc).is_err(){return}
                 let totals: Counts = after.values().fold([0;5], |mut a,b|{for i in 0..5 {a[i]+=b[i];}a});
                 let changes = deltas(&before,&after);
                 // Every changed allocation, not just the largest: correlate by

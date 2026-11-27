@@ -1264,14 +1264,13 @@ impl HostHeap {
             #[cfg(feature = "diagnostics")]
             {
                 let mut owners = self.resource_owners.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(old_identity) = old.as_ref().map(|resource| windows::core::Interface::as_raw(resource) as usize) {
-                    if let Some(count) = owners.get_mut(&old_identity) {
+                if let Some(old_identity) = old.as_ref().map(|resource| windows::core::Interface::as_raw(resource) as usize)
+                    && let Some(count) = owners.get_mut(&old_identity) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
                             owners.remove(&old_identity);
                         }
                     }
-                }
                 if let Some(identity) = new_identity {
                     *owners.entry(identity).or_default() += 1;
                 }
