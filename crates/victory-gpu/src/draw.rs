@@ -992,7 +992,11 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // D3D12 root signatures have a 64-dword budget. Keep the
+                // old heap fallback for unexpected larger declarations.
+                let mut stack = [0; 64];
+                let mut overflow = Vec::new();
+                let values = root_words(dwords as usize, &mut stack, &mut overflow);
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -2508,6 +2512,71 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+        }
+    }
+}
+
+fn root_words<'a>(count: usize, stack: &'a mut [u32; 64], overflow: &'a mut Vec<u32>) -> &'a mut [u32] {
+    match stack.get_mut(..count) {
+        Some(words) => words,
+        None => {
+            overflow.resize(count, 0);
+            overflow
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_words_tests {
+    use super::root_words;
+    use std::hint::black_box;
+
+    #[test]
+    fn root_words_cover_inline_limit_and_larger_declarations() {
+        for count in [0, 1, 32, 64, 65, 128] {
+            let mut stack = [0; 64];
+            let mut overflow = Vec::new();
+            let words = root_words(count, &mut stack, &mut overflow);
+            assert_eq!(words, vec![0; count]);
+            if count != 0 {
+                words[count - 1] = 13;
+            }
+            assert_eq!(overflow.len(), if count > 64 { count } else { 0 });
+        }
+    }
+
+    #[test]
+    #[ignore = "standalone optimized CPU allocation benchmark"]
+    fn inline_root_words_cost() {
+        fn run(inline: bool) -> u128 {
+            let start = std::time::Instant::now();
+            for i in 0..200_000 {
+                let count = black_box([8, 16, 32, 64][i % 4]);
+                let mut overflow;
+                let mut stack;
+                let words = if inline {
+                    stack = [0; 64];
+                    overflow = Vec::new();
+                    root_words(count, &mut stack, &mut overflow)
+                } else {
+                    overflow = vec![0; count];
+                    overflow.as_mut_slice()
+                };
+                words[count - 1] = i as u32;
+                black_box(words);
+            }
+            start.elapsed().as_micros()
+        }
+        run(false);
+        run(true);
+        for pair in 0..6 {
+            let (baseline, inline) = if pair % 2 == 0 {
+                (run(false), run(true))
+            } else {
+                let inline = run(true);
+                (run(false), inline)
+            };
+            eprintln!("root constants pair {pair}: vec_us={baseline} inline_us={inline}");
         }
     }
 }
