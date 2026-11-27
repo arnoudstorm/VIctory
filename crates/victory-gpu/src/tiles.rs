@@ -533,6 +533,7 @@ pub(crate) fn chunks(from: usize, to: usize) -> impl Iterator<Item = (usize, usi
 }
 
 /// For the memory line: tiles mapped (MB) and heaps held (MB).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn line() -> (u64, u64, u64) {
     let mb = |tiles: u64| tiles * TILE as u64 >> 20;
     (mb(MAPPED.load(Ordering::Relaxed)), mb(HEAPS.load(Ordering::Relaxed) * PER_HEAP as u64), mb(BY[0].load(Ordering::Relaxed)))
@@ -619,12 +620,16 @@ mod tests {
         long.map_range(&long_buffer, 12 * TILE, 12 * TILE + 4);
         assert_eq!(long.write_at(&long_buffer, 12 * TILE), lone);
         assert!(!SHARED.lock().unwrap().as_ref().unwrap().contains_key(&(BASE / TILE as u64 + 12)));
-        drop(short);
-        drop(long);
-        let left = SHARED.lock().unwrap().as_ref().map_or(0, |map| {
-            map.keys().filter(|&&page| (BASE / TILE as u64..BASE / TILE as u64 + 16).contains(&page)).count()
+        // Our direct readbacks are already fenced. Serialize teardown with
+        // runtime submissions so an unrelated test cannot defer this drop.
+        crate::host::with_idle_submissions(host, || {
+            drop(short);
+            drop(long);
+            let left = SHARED.lock().unwrap().as_ref().map_or(0, |map| {
+                map.keys().filter(|&&page| (BASE / TILE as u64..BASE / TILE as u64 + 16).contains(&page)).count()
+            });
+            assert_eq!(left, 0, "nothing stays shared once both windows are let go");
         });
-        assert_eq!(left, 0, "nothing stays shared once both windows are let go");
         assert!(host.device_alive());
     }
 }

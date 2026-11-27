@@ -3629,7 +3629,10 @@ mod tiled_tests {
         assert_ne!(first.read_at(TILE), second.read_at(0), "distinct mapped backing slots");
 
         let (source, cpu) = host.upload_buffer(256).expect("upload");
-        first.writing(overlap, 256);
+        crate::host::with_idle_submissions(host, || {
+            first.writing(overlap, 256);
+            take_snapshots();
+        });
         // SAFETY: source is mapped for 256 bytes, the copy uses mapped tiles,
         // and the explicit buffer transitions restore the common state.
         unsafe {
@@ -3742,8 +3745,7 @@ mod tiled_tests {
         let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
         assert!(!title.is_null() && title as usize % TILE == 0);
         // SAFETY: inside the allocation.
-        let title_bytes = unsafe { std::slice::from_raw_parts_mut(title, LEN) };
-        for (i, b) in title_bytes.iter_mut().enumerate() {
+        for (i, b) in unsafe { std::slice::from_raw_parts_mut(title, LEN) }.iter_mut().enumerate() {
             *b = (i / 4096) as u8 ^ 0x33;
         }
         let start = title as u64;
@@ -3761,14 +3763,19 @@ mod tiled_tests {
         assert_eq!(tiles(&shadow), 3);
         for off in [a, a + 1, 3 * TILE, b - 1] {
             // SAFETY: read_at is valid to its tile's end.
-            assert_eq!(unsafe { *shadow.read_at(off) }, title_bytes[off], "refreshed byte at {off:#x}");
+            assert_eq!(unsafe { *shadow.read_at(off) }, unsafe { *title.add(off) }, "refreshed byte at {off:#x}");
         }
         // SAFETY: as above.
         assert_eq!(unsafe { *shadow.read_at(10 * TILE) }, 0, "a tile never written reads 0");
 
         // Shaders write tiles 8-9: mapped and snapshotted at declaration.
         let (w0, w1) = (8 * TILE, 10 * TILE);
-        shadow.writing(start as usize + w0, w1 - w0);
+        // The fixture calls writing directly. Take the queued snapshots
+        // under the normal submission lock, before simulating GPU writes.
+        crate::host::with_idle_submissions(host, || {
+            shadow.writing(start as usize + w0, w1 - w0);
+            take_snapshots();
+        });
         assert_eq!(tiles(&shadow), 5);
         // "The card" writes 32 bytes in tile 9 (through the CPU side, as
         // the card's writes land in the same heap memory).
@@ -3777,6 +3784,8 @@ mod tiled_tests {
         unsafe { std::ptr::write_bytes(shadow.write_at(at), 0xee, 32) };
         let written = shadow.copy_back(start as usize + w0, w1 - w0);
         assert_eq!(written, 32);
+        // SAFETY: the title allocation is still live and copy-back is done.
+        let title_bytes = unsafe { std::slice::from_raw_parts(title, LEN) };
         assert!(title_bytes[at..at + 32].iter().all(|&x| x == 0xee), "the card's bytes reached title memory");
         assert_ne!(title_bytes[at + 32], 0xee);
         shadow.copy_back_done(&[(start as usize + w0, start as usize + w1)]);

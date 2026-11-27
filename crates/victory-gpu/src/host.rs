@@ -216,11 +216,17 @@ pub(crate) fn retire<T: 'static>(object: T) {
         drop(object);
         return;
     }
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    // Completion is published before draining this queue. Recheck while
+    // holding the same lock so a finished submission cannot miss this object.
+    if started <= FINISHED.load(Ordering::Acquire) {
+        drop(retired);
+        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        drop(object);
+    } else {
+        RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+        retired.push((started, Retired(Box::new(object))));
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -2619,6 +2625,14 @@ pub(crate) fn settle_now(why: usize) {
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
+
+#[cfg(test)]
+pub(crate) fn with_idle_submissions(host: &Host, work: impl FnOnce()) {
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    host.settle(&mut submitted, WHY_SYNC);
+    assert_eq!(STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire));
+    work();
+}
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
@@ -5008,57 +5022,6 @@ impl Host {
         }
         drop(submitted);
         land();
-    }
-
-    /// Sends `list`, a closed list of ours (the present's copy), as a
-    /// flight ([`late_free_present`]): not waited for, settled with the
-    /// others. The caller keeps the list and does not reset it before the
-    /// submission whose number comes back has finished ([`FINISHED`]); 0 if
-    /// it ran and was waited for after all.
-    fn execute_own(&self, list: &HostList) -> u64 {
-        late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], true) else {
-            return 0;
-        };
-        let number = sent.number;
-        {
-            let mut line = line();
-            let Line { line: items, written, by_copy, lists: flying, target, .. } = &mut *line;
-            join_ranges(
-                written,
-                sent.back
-                    .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.backs.iter().copied()),
-            );
-            join_copy_ranges(
-                by_copy,
-                sent.back
-                    .iter()
-                    .flat_map(|(shadow, ranges)| {
-                        let owner = std::sync::Arc::as_ptr(shadow) as usize;
-                        ranges.iter().map(move |&(a, b)| (owner, a, b))
-                    })
-                    .chain(sent.backs.iter().map(|&(a, b)| (0, a, b))),
-            );
-            *flying += 1;
-            *target = *submitted;
-            items.push(Late::Run(Flight {
-                number,
-                fence: *target,
-                lists: Vec::new(),
-                order: Vec::new(),
-                card: sent.card,
-                back: sent.back,
-                backs: sent.backs,
-            }));
-            items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
-        }
-        LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
-        LINE_MOVED.notify_one();
-        RELAY_MOVED.notify_one();
-        drop(submitted);
-        number
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and
@@ -7502,10 +7465,6 @@ struct Presenter {
     height: u32,
     format: DXGI_FORMAT,
     copy: HostList,
-    /// With presents sent ahead ([`late_free_present`]): a list for each
-    /// present in the air, and the submission it last flew as (it is used
-    /// again once that one has finished).
-    ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
     compositor: Option<Compositor>,
@@ -8150,7 +8109,6 @@ impl Host {
                 height,
                 format,
                 copy,
-                ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
                 compositor: None,
